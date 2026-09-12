@@ -197,7 +197,8 @@ CREATE TYPE public.payment_type_enum AS ENUM (
     'REFUND',
     'PAYOUT',
     'PLATFORM_REVENUE_SETTLEMENT',
-    'PLATFORM_REVENUE_REFUND'
+    'PLATFORM_REVENUE_REFUND',
+    'BILL_PAYMENT'
 );
 
 
@@ -320,8 +321,22 @@ CREATE TYPE public.webhook_status_enum AS ENUM (
     'RECEIVED',
     'PROCESSED',
     'FAILED',
-    'IGNORED'
+    'IGNORED',
+    'DEAD_LETTERED'
 );
+
+
+--
+-- Name: claim_due_payment_inquiries(text, integer, integer); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.claim_due_payment_inquiries(p_worker_id text, p_limit integer, p_lease_seconds integer DEFAULT 60) RETURNS TABLE(attempt_id uuid, tenant_id uuid, external_transfer_id uuid, provider_code character varying, provider_reference character varying)
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'public', 'pg_temp'
+    AS $$ BEGIN
+      IF nullif(btrim(p_worker_id),'') IS NULL OR p_limit<1 OR p_limit>100 OR p_lease_seconds<10 OR p_lease_seconds>600 THEN RAISE EXCEPTION 'Invalid inquiry claim'; END IF;
+      RETURN QUERY WITH due AS (SELECT a.id FROM public.payment_attempts a WHERE a.outcome_class IN('ACKNOWLEDGED_PENDING','AMBIGUOUS') AND a.next_inquiry_at<=now() AND (a.inquiry_lease_expires_at IS NULL OR a.inquiry_lease_expires_at<now()) ORDER BY a.next_inquiry_at FOR UPDATE SKIP LOCKED LIMIT p_limit), claimed AS (UPDATE public.payment_attempts a SET inquiry_lease_expires_at=now()+make_interval(secs=>p_lease_seconds),last_inquiry_at=now(),inquiry_attempts=a.inquiry_attempts+1 FROM due WHERE a.id=due.id RETURNING a.*) SELECT c.id,c.tenant_id,c.external_transfer_id,c.provider_code,c.provider_reference FROM claimed c;
+    END $$;
 
 
 --
@@ -362,6 +377,16 @@ $$;
 
 
 --
+-- Name: prevent_payment_routing_decision_change(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.prevent_payment_routing_decision_change() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN RAISE EXCEPTION 'Provider routing decisions are immutable'; END $$;
+
+
+--
 -- Name: prevent_platform_revenue_settlement_item_delete(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -384,6 +409,38 @@ BEGIN
     RETURN OLD;
 END;
 $$;
+
+
+--
+-- Name: prevent_unsafe_provider_change(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.prevent_unsafe_provider_change() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    DECLARE prior record; BEGIN
+      IF NEW.attempt_number>1 THEN SELECT outcome_class INTO prior FROM public.payment_attempts WHERE tenant_id=NEW.tenant_id AND payment_id=NEW.payment_id AND attempt_number=NEW.attempt_number-1;
+        IF prior.outcome_class NOT IN('NOT_SENT','DEFINITE_PRE_SUBMISSION_FAILURE','FINAL_FAILURE') THEN RAISE EXCEPTION 'Previous provider outcome prohibits failover'; END IF;
+      END IF; RETURN NEW;
+    END $$;
+
+
+--
+-- Name: protect_bill_immutable(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_bill_immutable() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$ BEGIN RAISE EXCEPTION 'Financial evidence is immutable'; END $$;
+
+
+--
+-- Name: protect_collection_history(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_collection_history() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$ BEGIN RAISE EXCEPTION 'Collection status history is immutable'; END $$;
 
 
 --
@@ -431,6 +488,43 @@ $$;
 
 
 --
+-- Name: protect_external_transfer_history(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_external_transfer_history() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$ BEGIN RAISE EXCEPTION 'External transfer history is immutable'; END $$;
+
+
+--
+-- Name: protect_internal_transfer_history(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_internal_transfer_history() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$ BEGIN RAISE EXCEPTION 'Internal transfer history is immutable'; END $$;
+
+
+--
+-- Name: protect_payment_reversal_history(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_payment_reversal_history() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$ BEGIN RAISE EXCEPTION 'Reversal history is immutable'; END $$;
+
+
+--
+-- Name: protect_payment_webhook_evidence(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_payment_webhook_evidence() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$ BEGIN
+      IF NEW.provider_code IS DISTINCT FROM OLD.provider_code OR NEW.event_reference IS DISTINCT FROM OLD.event_reference OR NEW.event_type IS DISTINCT FROM OLD.event_type OR NEW.payload IS DISTINCT FROM OLD.payload OR NEW.payload_hash IS DISTINCT FROM OLD.payload_hash OR NEW.signature_hash IS DISTINCT FROM OLD.signature_hash OR NEW.signature_verified IS DISTINCT FROM OLD.signature_verified OR NEW.signature_scheme IS DISTINCT FROM OLD.signature_scheme OR NEW.credential_key_version IS DISTINCT FROM OLD.credential_key_version OR NEW.received_at IS DISTINCT FROM OLD.received_at THEN RAISE EXCEPTION 'Webhook receipt evidence is immutable'; END IF; RETURN NEW; END $$;
+
+
+--
 -- Name: protect_platform_revenue_share_economics(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -464,6 +558,90 @@ $$;
 
 
 --
+-- Name: protect_submitted_payment_attempt(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_submitted_payment_attempt() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      IF OLD.submission_state<>'NOT_SENT' AND (NEW.provider_code IS DISTINCT FROM OLD.provider_code OR NEW.routing_decision_id IS DISTINCT FROM OLD.routing_decision_id OR NEW.request_hash IS DISTINCT FROM OLD.request_hash OR NEW.request_payload IS DISTINCT FROM OLD.request_payload) THEN RAISE EXCEPTION 'Submitted provider-attempt request evidence is immutable'; END IF;
+      IF NEW.outcome_certainty='AMBIGUOUS' AND NEW.submission_state='NOT_SENT' THEN RAISE EXCEPTION 'An unsubmitted attempt cannot have an ambiguous outcome'; END IF;
+      RETURN NEW;
+    END $$;
+
+
+--
+-- Name: record_bill_status(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.record_bill_status() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$ BEGIN IF TG_OP='INSERT' OR NEW.status IS DISTINCT FROM OLD.status THEN INSERT INTO public.bill_transaction_status_history(tenant_id,bill_transaction_id,previous_status,new_status,reason) VALUES(NEW.tenant_id,NEW.id,CASE WHEN TG_OP='INSERT' THEN NULL ELSE OLD.status END,NEW.status,NEW.failure_reason); END IF; RETURN NEW; END $$;
+
+
+--
+-- Name: record_collection_status(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.record_collection_status() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$ BEGIN
+      IF TG_OP='INSERT' OR NEW.status IS DISTINCT FROM OLD.status THEN
+        INSERT INTO public.payment_collection_status_history(tenant_id,collection_id,previous_status,new_status,reason)
+        VALUES(NEW.tenant_id,NEW.id,CASE WHEN TG_OP='INSERT' THEN NULL ELSE OLD.status END,NEW.status,NEW.failure_reason);
+      END IF; RETURN NEW;
+    END $$;
+
+
+--
+-- Name: record_external_transfer_status(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.record_external_transfer_status() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$ BEGIN
+      IF TG_OP='INSERT' OR NEW.status IS DISTINCT FROM OLD.status THEN INSERT INTO public.payment_external_transfer_history(tenant_id,transfer_id,previous_status,new_status,reason) VALUES(NEW.tenant_id,NEW.id,CASE WHEN TG_OP='INSERT' THEN NULL ELSE OLD.status END,NEW.status,NEW.failure_reason); END IF; RETURN NEW; END $$;
+
+
+--
+-- Name: record_internal_transfer_status(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.record_internal_transfer_status() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$ BEGIN
+      IF TG_OP='INSERT' OR NEW.status IS DISTINCT FROM OLD.status THEN INSERT INTO public.payment_internal_transfer_history(tenant_id,transfer_id,previous_status,new_status,reason) VALUES(NEW.tenant_id,NEW.id,CASE WHEN TG_OP='INSERT' THEN NULL ELSE OLD.status END,NEW.status,NEW.failure_reason); END IF; RETURN NEW; END $$;
+
+
+--
+-- Name: record_payment_reversal_status(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.record_payment_reversal_status() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$ BEGIN IF TG_OP='INSERT' OR NEW.status IS DISTINCT FROM OLD.status THEN INSERT INTO public.payment_reversal_history(tenant_id,reversal_id,previous_status,new_status,reason) VALUES(NEW.tenant_id,NEW.id,CASE WHEN TG_OP='INSERT' THEN NULL ELSE OLD.status END,NEW.status,NEW.failure_reason); END IF; RETURN NEW; END $$;
+
+
+--
+-- Name: record_verified_payment_webhook(text, text, text, jsonb, text, text, text, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.record_verified_payment_webhook(p_provider_code text, p_event_reference text, p_event_type text, p_payload jsonb, p_payload_hash text, p_signature_hash text, p_signature_scheme text, p_credential_key_version text) RETURNS TABLE(webhook_id uuid, replayed boolean)
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'public', 'pg_temp'
+    AS $$
+    DECLARE existing public.payment_webhooks%ROWTYPE; inserted_id uuid; BEGIN
+      IF p_provider_code NOT IN ('PAYSTACK','WEMA','BANKONE') OR nullif(btrim(p_event_reference),'') IS NULL OR length(p_payload_hash)<>64 OR length(p_signature_hash)<>64 OR nullif(btrim(p_signature_scheme),'') IS NULL OR nullif(btrim(p_credential_key_version),'') IS NULL THEN RAISE EXCEPTION 'Invalid verified webhook evidence'; END IF;
+      INSERT INTO public.payment_webhooks(provider_code,event_reference,event_type,payload,payload_hash,signature_verified,signature_hash,signature_scheme,credential_key_version) VALUES(p_provider_code,p_event_reference,p_event_type,p_payload,p_payload_hash,true,p_signature_hash,p_signature_scheme,p_credential_key_version) ON CONFLICT(provider_code,event_reference) DO NOTHING RETURNING id INTO inserted_id;
+      IF inserted_id IS NOT NULL THEN RETURN QUERY SELECT inserted_id,false; RETURN; END IF;
+      SELECT * INTO existing FROM public.payment_webhooks WHERE provider_code=p_provider_code AND event_reference=p_event_reference;
+      IF existing.payload_hash<>p_payload_hash OR existing.signature_scheme<>p_signature_scheme OR existing.credential_key_version<>p_credential_key_version THEN RAISE EXCEPTION 'Webhook identity reused with different evidence'; END IF;
+      RETURN QUERY SELECT existing.id,true;
+    END $$;
+
+
+--
 -- Name: set_updated_at(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -475,6 +653,75 @@ BEGIN
     RETURN NEW;
 END;
 $$;
+
+
+--
+-- Name: validate_bill_transaction(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_bill_transaction() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$ BEGIN IF TG_OP='UPDATE' AND (NEW.tenant_id,NEW.customer_id,NEW.source_account_id,NEW.product_id,NEW.provider_id,NEW.amount,NEW.fee_amount,NEW.tax_amount,NEW.cashback_amount,NEW.currency,NEW.idempotency_key,NEW.request_hash,NEW.routing_decision_id,NEW.quote_id) IS DISTINCT FROM (OLD.tenant_id,OLD.customer_id,OLD.source_account_id,OLD.product_id,OLD.provider_id,OLD.amount,OLD.fee_amount,OLD.tax_amount,OLD.cashback_amount,OLD.currency,OLD.idempotency_key,OLD.request_hash,OLD.routing_decision_id,OLD.quote_id) THEN RAISE EXCEPTION 'Bill command evidence is immutable'; END IF; RETURN NEW; END $$;
+
+
+--
+-- Name: validate_external_transfer(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_external_transfer() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO 'public', 'pg_temp'
+    AS $$
+    DECLARE src record; BEGIN
+      SELECT tenant_id,currency,status,customer_id,ledger_account_id INTO src FROM public.financial_accounts WHERE id=NEW.source_account_id;
+      IF src.tenant_id<>NEW.tenant_id OR btrim(src.currency)<>btrim(NEW.currency) OR src.status<>'ACTIVE' OR src.customer_id<>NEW.customer_id OR src.ledger_account_id IS DISTINCT FROM NEW.source_ledger_account_id THEN RAISE EXCEPTION 'External transfer requires an owned active mapped source account'; END IF;
+      IF TG_OP='UPDATE' AND NEW.status IS DISTINCT FROM OLD.status AND NOT (
+        (OLD.status='CREATED' AND NEW.status IN('RESERVED','FAILED')) OR (OLD.status='RESERVED' AND NEW.status IN('SUBMITTING','FAILED')) OR
+        (OLD.status='SUBMITTING' AND NEW.status IN('PENDING','SUCCEEDED','FAILED','MANUAL_REVIEW')) OR
+        (OLD.status='PENDING' AND NEW.status IN('SUCCEEDED','FAILED','REVERSED','MANUAL_REVIEW')) OR
+        (OLD.status='MANUAL_REVIEW' AND NEW.status IN('PENDING','SUCCEEDED','FAILED','REVERSED')) OR
+        (OLD.status='SUCCEEDED' AND NEW.status='REVERSED')
+      ) THEN RAISE EXCEPTION 'Invalid external transfer transition'; END IF;
+      IF TG_OP='UPDATE' AND (NEW.tenant_id,NEW.payment_id,NEW.customer_id,NEW.source_account_id,NEW.source_ledger_account_id,NEW.settlement_ledger_account_id,NEW.beneficiary_name,NEW.destination_account_number,NEW.destination_bank_code,NEW.amount,NEW.currency,NEW.idempotency_key,NEW.request_hash) IS DISTINCT FROM (OLD.tenant_id,OLD.payment_id,OLD.customer_id,OLD.source_account_id,OLD.source_ledger_account_id,OLD.settlement_ledger_account_id,OLD.beneficiary_name,OLD.destination_account_number,OLD.destination_bank_code,OLD.amount,OLD.currency,OLD.idempotency_key,OLD.request_hash) THEN RAISE EXCEPTION 'External transfer command evidence is immutable'; END IF;
+      RETURN NEW;
+    END $$;
+
+
+--
+-- Name: validate_internal_transfer(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_internal_transfer() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO 'public', 'pg_temp'
+    AS $$
+    DECLARE src record; dst record; BEGIN
+      SELECT tenant_id,currency,status,ledger_account_id INTO src FROM public.financial_accounts WHERE id=NEW.source_account_id;
+      SELECT tenant_id,currency,status,ledger_account_id INTO dst FROM public.financial_accounts WHERE id=NEW.destination_account_id;
+      IF src.tenant_id<>NEW.tenant_id OR dst.tenant_id<>NEW.tenant_id OR btrim(src.currency)<>btrim(NEW.currency) OR btrim(dst.currency)<>btrim(NEW.currency) THEN RAISE EXCEPTION 'Internal transfer tenant/currency mismatch'; END IF;
+      IF src.status<>'ACTIVE' OR dst.status<>'ACTIVE' OR src.ledger_account_id IS DISTINCT FROM NEW.source_ledger_account_id OR dst.ledger_account_id IS DISTINCT FROM NEW.destination_ledger_account_id THEN RAISE EXCEPTION 'Internal transfer requires active mapped accounts'; END IF;
+      IF TG_OP='UPDATE' AND NEW.status IS DISTINCT FROM OLD.status AND NOT (
+        (OLD.status='CREATED' AND NEW.status IN('RESERVED','FAILED')) OR
+        (OLD.status='RESERVED' AND NEW.status IN('CAPTURING','FAILED')) OR
+        (OLD.status='CAPTURING' AND NEW.status IN('SUCCEEDED','MANUAL_REVIEW')) OR
+        (OLD.status='MANUAL_REVIEW' AND NEW.status IN('CAPTURING','SUCCEEDED','FAILED'))
+      ) THEN RAISE EXCEPTION 'Invalid internal transfer transition'; END IF;
+      IF TG_OP='UPDATE' AND (NEW.tenant_id,NEW.payment_id,NEW.customer_id,NEW.source_account_id,NEW.destination_account_id,NEW.source_ledger_account_id,NEW.destination_ledger_account_id,NEW.amount,NEW.currency,NEW.idempotency_key,NEW.request_hash) IS DISTINCT FROM (OLD.tenant_id,OLD.payment_id,OLD.customer_id,OLD.source_account_id,OLD.destination_account_id,OLD.source_ledger_account_id,OLD.destination_ledger_account_id,OLD.amount,OLD.currency,OLD.idempotency_key,OLD.request_hash) THEN RAISE EXCEPTION 'Internal transfer command evidence is immutable'; END IF;
+      RETURN NEW;
+    END $$;
+
+
+--
+-- Name: validate_payment_reversal(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_payment_reversal() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$ BEGIN
+      IF NEW.approval_id IS NULL AND NEW.automated_rule_id IS NULL THEN RAISE EXCEPTION 'Reversal authority is required'; END IF;
+      IF TG_OP='UPDATE' AND (NEW.tenant_id,NEW.payment_id,NEW.amount,NEW.currency,NEW.idempotency_key,NEW.request_hash,NEW.original_ledger_transaction_id,NEW.approval_id,NEW.automated_rule_id) IS DISTINCT FROM (OLD.tenant_id,OLD.payment_id,OLD.amount,OLD.currency,OLD.idempotency_key,OLD.request_hash,OLD.original_ledger_transaction_id,OLD.approval_id,OLD.automated_rule_id) THEN RAISE EXCEPTION 'Reversal command evidence is immutable'; END IF;
+      IF TG_OP='UPDATE' AND NEW.status IS DISTINCT FROM OLD.status AND NOT((OLD.status='PENDING' AND NEW.status IN('PROCESSING','FAILED')) OR (OLD.status='PROCESSING' AND NEW.status IN('SUCCESSFUL','FAILED'))) THEN RAISE EXCEPTION 'Invalid reversal transition'; END IF; RETURN NEW;
+    END $$;
 
 
 --
@@ -653,6 +900,19 @@ END;
 $$;
 
 
+--
+-- Name: validate_provider_attempt_outcome(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_provider_attempt_outcome() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$ BEGIN
+      IF NEW.outcome_class IN('ACKNOWLEDGED_PENDING','AMBIGUOUS','FINAL_SUCCESS','FINAL_FAILURE','REVERSED') AND NEW.submission_state='NOT_SENT' THEN RAISE EXCEPTION 'Submitted outcome requires submission evidence'; END IF;
+      IF NEW.request_payload::text ~* '"(bvn|nin|pin|password|token|secret|credential)"[[:space:]]*:' OR NEW.response_payload::text ~* '"(bvn|nin|pin|password|token|secret|credential)"[[:space:]]*:' THEN RAISE EXCEPTION 'Sensitive provider evidence is prohibited'; END IF;
+      RETURN NEW;
+    END $$;
+
+
 SET default_tablespace = '';
 
 SET default_table_access_method = heap;
@@ -675,6 +935,8 @@ CREATE TABLE public.account_provider_accounts (
     deleted_at timestamp with time zone
 );
 
+ALTER TABLE ONLY public.account_provider_accounts FORCE ROW LEVEL SECURITY;
+
 
 --
 -- Name: account_providers; Type: TABLE; Schema: public; Owner: -
@@ -696,6 +958,8 @@ CREATE TABLE public.account_providers (
     deleted_at timestamp with time zone
 );
 
+ALTER TABLE ONLY public.account_providers FORCE ROW LEVEL SECURITY;
+
 
 --
 -- Name: account_status_history; Type: TABLE; Schema: public; Owner: -
@@ -711,6 +975,8 @@ CREATE TABLE public.account_status_history (
     changed_by uuid,
     created_at timestamp with time zone DEFAULT now() NOT NULL
 );
+
+ALTER TABLE ONLY public.account_status_history FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -738,6 +1004,8 @@ CREATE TABLE public.beneficiaries (
     deleted_at timestamp with time zone
 );
 
+ALTER TABLE ONLY public.beneficiaries FORCE ROW LEVEL SECURITY;
+
 
 --
 -- Name: bill_categories; Type: TABLE; Schema: public; Owner: -
@@ -755,6 +1023,67 @@ CREATE TABLE public.bill_categories (
 
 
 --
+-- Name: bill_customer_validations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.bill_customer_validations (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    customer_id uuid NOT NULL,
+    product_id uuid NOT NULL,
+    customer_identifier character varying(200) NOT NULL,
+    normalized_customer_name character varying(200),
+    provider_code character varying(50) NOT NULL,
+    provider_reference character varying(200),
+    routing_decision_id uuid NOT NULL,
+    idempotency_key character varying(255) NOT NULL,
+    request_hash character(64) NOT NULL,
+    evidence_hash character(64) NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT bill_customer_validations_check CHECK ((expires_at > created_at))
+);
+
+ALTER TABLE ONLY public.bill_customer_validations FORCE ROW LEVEL SECURITY;
+
+
+--
+-- Name: bill_payment_quotes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.bill_payment_quotes (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    customer_id uuid NOT NULL,
+    product_id uuid NOT NULL,
+    validation_id uuid,
+    amount bigint NOT NULL,
+    fee_amount bigint NOT NULL,
+    tax_amount bigint NOT NULL,
+    cashback_amount bigint NOT NULL,
+    total_debit bigint NOT NULL,
+    currency character(3) NOT NULL,
+    catalogue_version integer NOT NULL,
+    provider_code character varying(50) NOT NULL,
+    routing_decision_id uuid NOT NULL,
+    idempotency_key character varying(255) NOT NULL,
+    request_hash character(64) NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT bill_payment_quotes_amount_check CHECK ((amount > 0)),
+    CONSTRAINT bill_payment_quotes_cashback_amount_check CHECK ((cashback_amount >= 0)),
+    CONSTRAINT bill_payment_quotes_catalogue_version_check CHECK ((catalogue_version > 0)),
+    CONSTRAINT bill_payment_quotes_check CHECK ((total_debit = ((amount + fee_amount) + tax_amount))),
+    CONSTRAINT bill_payment_quotes_check1 CHECK ((expires_at > created_at)),
+    CONSTRAINT bill_payment_quotes_currency_check CHECK ((currency = 'NGN'::bpchar)),
+    CONSTRAINT bill_payment_quotes_fee_amount_check CHECK ((fee_amount >= 0)),
+    CONSTRAINT bill_payment_quotes_tax_amount_check CHECK ((tax_amount >= 0))
+);
+
+ALTER TABLE ONLY public.bill_payment_quotes FORCE ROW LEVEL SECURITY;
+
+
+--
 -- Name: bill_products; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -765,19 +1094,37 @@ CREATE TABLE public.bill_products (
     product_code character varying(100) NOT NULL,
     product_name character varying(200) NOT NULL,
     description text,
-    amount numeric(20,2),
-    min_amount numeric(20,2),
-    max_amount numeric(20,2),
+    amount bigint,
+    min_amount bigint,
+    max_amount bigint,
     currency character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
     is_active boolean DEFAULT true NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     deleted_at timestamp with time zone,
-    CONSTRAINT chk_bill_product_amount CHECK (((amount IS NULL) OR (amount >= (0)::numeric))),
+    category_id uuid NOT NULL,
+    catalogue_version integer DEFAULT 1 NOT NULL,
+    published_at timestamp with time zone,
+    effective_from timestamp with time zone DEFAULT now() NOT NULL,
+    effective_to timestamp with time zone,
+    denomination_type character varying(20) DEFAULT 'VARIABLE'::character varying NOT NULL,
+    fee_amount bigint DEFAULT 0 NOT NULL,
+    tax_amount bigint DEFAULT 0 NOT NULL,
+    cashback_amount bigint DEFAULT 0 NOT NULL,
+    CONSTRAINT bill_products_cashback_amount_check CHECK ((cashback_amount >= 0)),
+    CONSTRAINT bill_products_catalogue_version_check CHECK ((catalogue_version > 0)),
+    CONSTRAINT bill_products_denomination_type_check CHECK (((denomination_type)::text = ANY ((ARRAY['FIXED'::character varying, 'VARIABLE'::character varying])::text[]))),
+    CONSTRAINT bill_products_fee_amount_check CHECK ((fee_amount >= 0)),
+    CONSTRAINT bill_products_tax_amount_check CHECK ((tax_amount >= 0)),
+    CONSTRAINT chk_bill_product_amount CHECK (((amount IS NULL) OR ((amount)::numeric >= (0)::numeric))),
     CONSTRAINT chk_bill_product_currency CHECK ((currency ~ '^[A-Z]{3}$'::text)),
-    CONSTRAINT chk_bill_product_range CHECK ((((min_amount IS NULL) OR (min_amount >= (0)::numeric)) AND ((max_amount IS NULL) OR ((max_amount >= (0)::numeric) AND ((min_amount IS NULL) OR (max_amount >= min_amount))))))
+    CONSTRAINT chk_bill_product_denomination CHECK (((((denomination_type)::text = 'FIXED'::text) AND (amount IS NOT NULL) AND (min_amount IS NULL) AND (max_amount IS NULL)) OR (((denomination_type)::text = 'VARIABLE'::text) AND (amount IS NULL) AND (min_amount IS NOT NULL) AND (max_amount IS NOT NULL)))),
+    CONSTRAINT chk_bill_product_ngn CHECK ((currency = 'NGN'::bpchar)),
+    CONSTRAINT chk_bill_product_range CHECK ((((min_amount IS NULL) OR ((min_amount)::numeric >= (0)::numeric)) AND ((max_amount IS NULL) OR (((max_amount)::numeric >= (0)::numeric) AND ((min_amount IS NULL) OR ((max_amount)::numeric >= (min_amount)::numeric))))))
 );
+
+ALTER TABLE ONLY public.bill_products FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -794,8 +1141,12 @@ CREATE TABLE public.bill_provider_transactions (
     status character varying(50),
     raw_response jsonb,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    evidence_hash character(64),
+    raw_evidence_expires_at timestamp with time zone DEFAULT (now() + '30 days'::interval) NOT NULL
 );
+
+ALTER TABLE ONLY public.bill_provider_transactions FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -816,6 +1167,8 @@ CREATE TABLE public.bill_providers (
     deleted_at timestamp with time zone
 );
 
+ALTER TABLE ONLY public.bill_providers FORCE ROW LEVEL SECURITY;
+
 
 --
 -- Name: bill_transaction_attempts; Type: TABLE; Schema: public; Owner: -
@@ -835,8 +1188,38 @@ CREATE TABLE public.bill_transaction_attempts (
     started_at timestamp with time zone,
     completed_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    request_hash character(64),
+    submission_state character varying(20) DEFAULT 'NOT_SENT'::character varying NOT NULL,
+    outcome_class character varying(30) DEFAULT 'NOT_SUBMITTED'::character varying NOT NULL,
+    next_inquiry_at timestamp with time zone,
+    inquiry_attempts integer DEFAULT 0 NOT NULL,
+    inquiry_lease_expires_at timestamp with time zone,
+    evidence_hash character(64),
+    raw_evidence_expires_at timestamp with time zone DEFAULT (now() + '30 days'::interval) NOT NULL,
+    CONSTRAINT bill_transaction_attempts_inquiry_attempts_check CHECK ((inquiry_attempts >= 0)),
+    CONSTRAINT bill_transaction_attempts_outcome_class_check CHECK (((outcome_class)::text = ANY ((ARRAY['NOT_SUBMITTED'::character varying, 'ACKNOWLEDGED_PENDING'::character varying, 'AMBIGUOUS'::character varying, 'FINAL_SUCCESS'::character varying, 'FINAL_FAILURE'::character varying, 'REVERSED'::character varying])::text[]))),
+    CONSTRAINT bill_transaction_attempts_submission_state_check CHECK (((submission_state)::text = ANY ((ARRAY['NOT_SENT'::character varying, 'SUBMITTED'::character varying, 'ACKNOWLEDGED'::character varying])::text[]))),
     CONSTRAINT chk_bill_attempt_number CHECK ((attempt_number > 0))
 );
+
+ALTER TABLE ONLY public.bill_transaction_attempts FORCE ROW LEVEL SECURITY;
+
+
+--
+-- Name: bill_transaction_status_history; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.bill_transaction_status_history (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    bill_transaction_id uuid NOT NULL,
+    previous_status public.bill_transaction_status_enum,
+    new_status public.bill_transaction_status_enum NOT NULL,
+    reason text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+ALTER TABLE ONLY public.bill_transaction_status_history FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -853,8 +1236,8 @@ CREATE TABLE public.bill_transactions (
     product_id uuid,
     reference character varying(100) NOT NULL,
     customer_identifier character varying(200) NOT NULL,
-    amount numeric(20,2) NOT NULL,
-    fee_amount numeric(20,2) DEFAULT 0 NOT NULL,
+    amount bigint NOT NULL,
+    fee_amount bigint DEFAULT 0 NOT NULL,
     currency character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     status public.bill_transaction_status_enum DEFAULT 'PENDING'::public.bill_transaction_status_enum NOT NULL,
     channel public.payment_channel_enum NOT NULL,
@@ -871,10 +1254,36 @@ CREATE TABLE public.bill_transactions (
     created_by uuid,
     updated_by uuid,
     deleted_at timestamp with time zone,
-    CONSTRAINT chk_bill_transaction_amount CHECK ((amount > (0)::numeric)),
+    quote_id uuid,
+    idempotency_key character varying(255),
+    request_hash character(64),
+    routing_decision_id uuid,
+    provider_selection_version integer,
+    ledger_hold_id uuid,
+    ledger_transaction_id uuid,
+    ledger_reversal_transaction_id uuid,
+    source_ledger_account_id uuid,
+    provider_payable_ledger_account_id uuid,
+    tax_ledger_account_id uuid,
+    revenue_ledger_account_id uuid,
+    cashback_ledger_account_id uuid,
+    tax_amount bigint DEFAULT 0 NOT NULL,
+    cashback_amount bigint DEFAULT 0 NOT NULL,
+    total_debit bigint,
+    outcome_class character varying(30) DEFAULT 'NOT_SUBMITTED'::character varying NOT NULL,
+    next_inquiry_at timestamp with time zone,
+    financial_record_retain_until timestamp with time zone DEFAULT (now() + '7 years'::interval) NOT NULL,
+    CONSTRAINT bill_transactions_cashback_amount_check CHECK ((cashback_amount >= 0)),
+    CONSTRAINT bill_transactions_outcome_class_check CHECK (((outcome_class)::text = ANY ((ARRAY['NOT_SUBMITTED'::character varying, 'ACKNOWLEDGED_PENDING'::character varying, 'AMBIGUOUS'::character varying, 'FINAL_SUCCESS'::character varying, 'FINAL_FAILURE'::character varying, 'REVERSED'::character varying])::text[]))),
+    CONSTRAINT bill_transactions_tax_amount_check CHECK ((tax_amount >= 0)),
+    CONSTRAINT chk_bill_total CHECK ((total_debit = ((amount + fee_amount) + tax_amount))),
+    CONSTRAINT chk_bill_transaction_amount CHECK (((amount)::numeric > (0)::numeric)),
     CONSTRAINT chk_bill_transaction_currency CHECK ((currency ~ '^[A-Z]{3}$'::text)),
-    CONSTRAINT chk_bill_transaction_fee CHECK ((fee_amount >= (0)::numeric))
+    CONSTRAINT chk_bill_transaction_fee CHECK (((fee_amount)::numeric >= (0)::numeric)),
+    CONSTRAINT chk_bill_transaction_ngn CHECK ((currency = 'NGN'::bpchar))
 );
+
+ALTER TABLE ONLY public.bill_transactions FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -892,8 +1301,14 @@ CREATE TABLE public.bill_webhooks (
     status public.webhook_status_enum DEFAULT 'RECEIVED'::public.webhook_status_enum NOT NULL,
     received_at timestamp with time zone DEFAULT now() NOT NULL,
     processed_at timestamp with time zone,
-    processing_error text
+    processing_error text,
+    payload_hash character(64),
+    signature_scheme character varying(50),
+    signing_key_version character varying(100),
+    raw_evidence_expires_at timestamp with time zone DEFAULT (now() + '30 days'::interval) NOT NULL
 );
+
+ALTER TABLE ONLY public.bill_webhooks FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -920,8 +1335,11 @@ CREATE TABLE public.financial_accounts (
     created_by uuid,
     updated_by uuid,
     deleted_at timestamp with time zone,
+    ledger_account_id uuid,
     CONSTRAINT chk_account_currency CHECK ((currency ~ '^[A-Z]{3}$'::text))
 );
+
+ALTER TABLE ONLY public.financial_accounts FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -943,8 +1361,76 @@ CREATE TABLE public.payment_attempts (
     started_at timestamp with time zone,
     completed_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT chk_payment_attempt_number CHECK ((attempt_number > 0))
+    routing_decision_id uuid,
+    request_hash character(64),
+    submission_state character varying(20) DEFAULT 'NOT_SENT'::character varying NOT NULL,
+    outcome_certainty character varying(20) DEFAULT 'KNOWN'::character varying NOT NULL,
+    outcome_class character varying(40) NOT NULL,
+    inquiry_attempts integer DEFAULT 0 NOT NULL,
+    next_inquiry_at timestamp with time zone,
+    inquiry_lease_expires_at timestamp with time zone,
+    last_inquiry_at timestamp with time zone,
+    external_transfer_id uuid,
+    CONSTRAINT chk_payment_attempt_number CHECK ((attempt_number > 0)),
+    CONSTRAINT payment_attempts_inquiry_attempts_check CHECK ((inquiry_attempts >= 0)),
+    CONSTRAINT payment_attempts_outcome_certainty_check CHECK (((outcome_certainty)::text = ANY (ARRAY[('KNOWN'::character varying)::text, ('AMBIGUOUS'::character varying)::text]))),
+    CONSTRAINT payment_attempts_outcome_class_check CHECK (((outcome_class)::text = ANY (ARRAY[('NOT_SENT'::character varying)::text, ('DEFINITE_PRE_SUBMISSION_FAILURE'::character varying)::text, ('ACKNOWLEDGED_PENDING'::character varying)::text, ('AMBIGUOUS'::character varying)::text, ('FINAL_SUCCESS'::character varying)::text, ('FINAL_FAILURE'::character varying)::text, ('REVERSED'::character varying)::text]))),
+    CONSTRAINT payment_attempts_submission_state_check CHECK (((submission_state)::text = ANY (ARRAY[('NOT_SENT'::character varying)::text, ('SUBMITTED'::character varying)::text, ('ACKNOWLEDGED'::character varying)::text])))
 );
+
+ALTER TABLE ONLY public.payment_attempts FORCE ROW LEVEL SECURITY;
+
+
+--
+-- Name: payment_collection_status_history; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.payment_collection_status_history (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    collection_id uuid NOT NULL,
+    previous_status character varying(30),
+    new_status character varying(30) NOT NULL,
+    reason text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+ALTER TABLE ONLY public.payment_collection_status_history FORCE ROW LEVEL SECURITY;
+
+
+--
+-- Name: payment_collections; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.payment_collections (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    financial_account_id uuid NOT NULL,
+    payment_id uuid NOT NULL,
+    customer_id uuid NOT NULL,
+    webhook_id uuid,
+    provider_code character varying(50) NOT NULL,
+    provider_reference character varying(200) NOT NULL,
+    amount bigint NOT NULL,
+    currency character(3) NOT NULL,
+    payload_hash character(64) NOT NULL,
+    status character varying(30) DEFAULT 'VERIFIED'::character varying NOT NULL,
+    debit_ledger_account_id uuid NOT NULL,
+    credit_ledger_account_id uuid NOT NULL,
+    ledger_idempotency_key character varying(255) NOT NULL,
+    ledger_transaction_id uuid,
+    failure_code character varying(100),
+    failure_reason text,
+    provider_paid_at timestamp with time zone,
+    posted_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT chk_collection_currency CHECK ((currency ~ '^[A-Z]{3}$'::text)),
+    CONSTRAINT payment_collections_amount_check CHECK ((amount > 0)),
+    CONSTRAINT payment_collections_status_check CHECK (((status)::text = ANY (ARRAY[('VERIFIED'::character varying)::text, ('POSTING'::character varying)::text, ('POSTED'::character varying)::text, ('FAILED'::character varying)::text, ('MANUAL_REVIEW'::character varying)::text])))
+);
+
+ALTER TABLE ONLY public.payment_collections FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -965,8 +1451,70 @@ CREATE TABLE public.payment_disputes (
     resolved_at timestamp with time zone,
     created_by uuid,
     updated_by uuid,
-    CONSTRAINT chk_payment_dispute_status CHECK (((status)::text = ANY ((ARRAY['OPEN'::character varying, 'UNDER_REVIEW'::character varying, 'RESOLVED'::character varying, 'REJECTED'::character varying, 'CLOSED'::character varying])::text[])))
+    CONSTRAINT chk_payment_dispute_status CHECK (((status)::text = ANY (ARRAY[('OPEN'::character varying)::text, ('UNDER_REVIEW'::character varying)::text, ('RESOLVED'::character varying)::text, ('REJECTED'::character varying)::text, ('CLOSED'::character varying)::text])))
 );
+
+ALTER TABLE ONLY public.payment_disputes FORCE ROW LEVEL SECURITY;
+
+
+--
+-- Name: payment_external_transfer_history; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.payment_external_transfer_history (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    transfer_id uuid NOT NULL,
+    previous_status character varying(30),
+    new_status character varying(30) NOT NULL,
+    reason text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+ALTER TABLE ONLY public.payment_external_transfer_history FORCE ROW LEVEL SECURITY;
+
+
+--
+-- Name: payment_external_transfers; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.payment_external_transfers (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    payment_id uuid NOT NULL,
+    customer_id uuid NOT NULL,
+    source_account_id uuid NOT NULL,
+    source_ledger_account_id uuid NOT NULL,
+    settlement_ledger_account_id uuid NOT NULL,
+    beneficiary_id uuid,
+    beneficiary_name character varying(200) NOT NULL,
+    destination_account_number character varying(100) NOT NULL,
+    destination_bank_code character varying(20) NOT NULL,
+    destination_bank_name character varying(150),
+    destination_phone_number character varying(30),
+    amount bigint NOT NULL,
+    currency character(3) NOT NULL,
+    narration character varying(100) NOT NULL,
+    idempotency_key character varying(255) NOT NULL,
+    request_hash character(64) NOT NULL,
+    correlation_id uuid NOT NULL,
+    status character varying(30) DEFAULT 'CREATED'::character varying NOT NULL,
+    ledger_hold_id uuid,
+    ledger_transaction_id uuid,
+    active_attempt_id uuid,
+    failure_code character varying(100),
+    failure_reason text,
+    reserved_at timestamp with time zone,
+    submitted_at timestamp with time zone,
+    completed_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT chk_external_currency CHECK ((currency ~ '^[A-Z]{3}$'::text)),
+    CONSTRAINT payment_external_transfers_amount_check CHECK ((amount > 0)),
+    CONSTRAINT payment_external_transfers_status_check CHECK (((status)::text = ANY (ARRAY[('CREATED'::character varying)::text, ('RESERVED'::character varying)::text, ('SUBMITTING'::character varying)::text, ('PENDING'::character varying)::text, ('SUCCEEDED'::character varying)::text, ('FAILED'::character varying)::text, ('REVERSED'::character varying)::text, ('MANUAL_REVIEW'::character varying)::text])))
+);
+
+ALTER TABLE ONLY public.payment_external_transfers FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -978,14 +1526,16 @@ CREATE TABLE public.payment_fees (
     tenant_id uuid NOT NULL,
     payment_id uuid NOT NULL,
     fee_type public.fee_type_enum NOT NULL,
-    amount numeric(20,2) NOT NULL,
+    amount bigint NOT NULL,
     currency character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     fee_bearer public.fee_bearer_enum,
     description character varying(255),
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT chk_payment_fee_amount CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT chk_payment_fee_amount CHECK (((amount)::numeric >= (0)::numeric)),
     CONSTRAINT chk_payment_fee_currency CHECK ((currency ~ '^[A-Z]{3}$'::text))
 );
+
+ALTER TABLE ONLY public.payment_fees FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -1005,6 +1555,62 @@ CREATE TABLE public.payment_idempotency_keys (
     expires_at timestamp with time zone NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL
 );
+
+ALTER TABLE ONLY public.payment_idempotency_keys FORCE ROW LEVEL SECURITY;
+
+
+--
+-- Name: payment_internal_transfer_history; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.payment_internal_transfer_history (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    transfer_id uuid NOT NULL,
+    previous_status character varying(30),
+    new_status character varying(30) NOT NULL,
+    reason text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+ALTER TABLE ONLY public.payment_internal_transfer_history FORCE ROW LEVEL SECURITY;
+
+
+--
+-- Name: payment_internal_transfers; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.payment_internal_transfers (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    payment_id uuid NOT NULL,
+    customer_id uuid NOT NULL,
+    source_account_id uuid NOT NULL,
+    destination_account_id uuid NOT NULL,
+    source_ledger_account_id uuid NOT NULL,
+    destination_ledger_account_id uuid NOT NULL,
+    amount bigint NOT NULL,
+    currency character(3) NOT NULL,
+    narration character varying(140) NOT NULL,
+    idempotency_key character varying(255) NOT NULL,
+    request_hash character(64) NOT NULL,
+    correlation_id uuid NOT NULL,
+    status character varying(30) DEFAULT 'CREATED'::character varying NOT NULL,
+    ledger_hold_id uuid,
+    ledger_transaction_id uuid,
+    failure_code character varying(100),
+    failure_reason text,
+    reserved_at timestamp with time zone,
+    completed_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT chk_internal_transfer_currency CHECK ((currency ~ '^[A-Z]{3}$'::text)),
+    CONSTRAINT chk_internal_transfer_distinct_accounts CHECK (((source_account_id <> destination_account_id) AND (source_ledger_account_id <> destination_ledger_account_id))),
+    CONSTRAINT payment_internal_transfers_amount_check CHECK ((amount > 0)),
+    CONSTRAINT payment_internal_transfers_status_check CHECK (((status)::text = ANY (ARRAY[('CREATED'::character varying)::text, ('RESERVED'::character varying)::text, ('CAPTURING'::character varying)::text, ('SUCCEEDED'::character varying)::text, ('FAILED'::character varying)::text, ('MANUAL_REVIEW'::character varying)::text])))
+);
+
+ALTER TABLE ONLY public.payment_internal_transfers FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -1030,8 +1636,10 @@ CREATE TABLE public.payment_outbox_events (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT chk_outbox_event_version CHECK ((event_version > 0)),
     CONSTRAINT chk_outbox_retry_count CHECK ((retry_count >= 0)),
-    CONSTRAINT chk_outbox_status CHECK (((status)::text = ANY ((ARRAY['PENDING'::character varying, 'PUBLISHED'::character varying, 'FAILED'::character varying])::text[])))
+    CONSTRAINT chk_outbox_status CHECK (((status)::text = ANY (ARRAY[('PENDING'::character varying)::text, ('PUBLISHED'::character varying)::text, ('FAILED'::character varying)::text])))
 );
+
+ALTER TABLE ONLY public.payment_outbox_events FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -1050,8 +1658,35 @@ CREATE TABLE public.payment_parties (
     bank_name character varying(150),
     phone_number character varying(30),
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT chk_payment_party_role CHECK (((party_role)::text = ANY ((ARRAY['SENDER'::character varying, 'RECIPIENT'::character varying, 'PLATFORM'::character varying, 'TENANT'::character varying, 'PROVIDER'::character varying])::text[])))
+    CONSTRAINT chk_payment_party_role CHECK (((party_role)::text = ANY (ARRAY[('SENDER'::character varying)::text, ('RECIPIENT'::character varying)::text, ('PLATFORM'::character varying)::text, ('TENANT'::character varying)::text, ('PROVIDER'::character varying)::text])))
 );
+
+ALTER TABLE ONLY public.payment_parties FORCE ROW LEVEL SECURITY;
+
+
+--
+-- Name: payment_provider_routing_decisions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.payment_provider_routing_decisions (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    capability character varying(50) NOT NULL,
+    currency character(3) NOT NULL,
+    provider_code character varying(50) NOT NULL,
+    selection_id uuid NOT NULL,
+    selection_version integer NOT NULL,
+    routing_reason character varying(40) NOT NULL,
+    request_hash character(64) NOT NULL,
+    correlation_id uuid NOT NULL,
+    idempotency_key character varying(255) NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT chk_routing_currency CHECK ((currency ~ '^[A-Z]{3}$'::text)),
+    CONSTRAINT payment_provider_routing_decisions_routing_reason_check CHECK (((routing_reason)::text = ANY (ARRAY[('PREFERRED'::character varying)::text, ('CIRCUIT_OPEN'::character varying)::text, ('PRE_SUBMISSION_FAILURE'::character varying)::text]))),
+    CONSTRAINT payment_provider_routing_decisions_selection_version_check CHECK ((selection_version > 0))
+);
+
+ALTER TABLE ONLY public.payment_provider_routing_decisions FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -1071,6 +1706,8 @@ CREATE TABLE public.payment_provider_transactions (
     updated_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
+ALTER TABLE ONLY public.payment_provider_transactions FORCE ROW LEVEL SECURITY;
+
 
 --
 -- Name: payment_reconciliation_records; Type: TABLE; Schema: public; Owner: -
@@ -1085,26 +1722,85 @@ CREATE TABLE public.payment_reconciliation_records (
     resource_id uuid,
     provider_code character varying(50) NOT NULL,
     provider_reference character varying(200),
-    provider_amount numeric(20,2),
-    internal_amount numeric(20,2),
-    provider_fee_amount numeric(20,2),
-    expected_net_amount numeric(20,2),
-    actual_settlement_amount numeric(20,2),
+    provider_amount bigint,
+    internal_amount bigint,
+    provider_fee_amount bigint,
+    expected_net_amount bigint,
+    actual_settlement_amount bigint,
     fee_bearer public.fee_bearer_enum,
     currency character(3),
     status public.reconciliation_status_enum NOT NULL,
-    difference_amount numeric(20,2),
+    difference_amount bigint,
     reconciliation_date date NOT NULL,
     provider_payload jsonb,
     resolution_notes text,
     resolved_by uuid,
     resolved_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT chk_reconciliation_amounts CHECK ((((provider_amount IS NULL) OR (provider_amount >= (0)::numeric)) AND ((internal_amount IS NULL) OR (internal_amount >= (0)::numeric)) AND ((provider_fee_amount IS NULL) OR (provider_fee_amount >= (0)::numeric)) AND ((expected_net_amount IS NULL) OR (expected_net_amount >= (0)::numeric)) AND ((actual_settlement_amount IS NULL) OR (actual_settlement_amount >= (0)::numeric)))),
+    run_id uuid,
+    evidence_hash character(64),
+    discrepancy_key character(64),
+    financially_consequential boolean DEFAULT true NOT NULL,
+    retain_until timestamp with time zone DEFAULT (now() + '7 years'::interval) NOT NULL,
+    CONSTRAINT chk_reconciliation_amounts CHECK ((((provider_amount IS NULL) OR ((provider_amount)::numeric >= (0)::numeric)) AND ((internal_amount IS NULL) OR ((internal_amount)::numeric >= (0)::numeric)) AND ((provider_fee_amount IS NULL) OR ((provider_fee_amount)::numeric >= (0)::numeric)) AND ((expected_net_amount IS NULL) OR ((expected_net_amount)::numeric >= (0)::numeric)) AND ((actual_settlement_amount IS NULL) OR ((actual_settlement_amount)::numeric >= (0)::numeric)))),
     CONSTRAINT chk_reconciliation_currency CHECK (((currency IS NULL) OR (currency ~ '^[A-Z]{3}$'::text))),
-    CONSTRAINT chk_reconciliation_difference CHECK (((difference_amount IS NULL) OR (difference_amount >= (0)::numeric))),
     CONSTRAINT chk_reconciliation_resource CHECK (((payment_id IS NOT NULL) OR (platform_revenue_settlement_id IS NOT NULL) OR (resource_id IS NOT NULL)))
 );
+
+ALTER TABLE ONLY public.payment_reconciliation_records FORCE ROW LEVEL SECURITY;
+
+
+--
+-- Name: payment_reconciliation_runs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.payment_reconciliation_runs (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    provider_code character varying(50) NOT NULL,
+    period_start timestamp with time zone NOT NULL,
+    period_end timestamp with time zone NOT NULL,
+    source_object_reference character varying(500) NOT NULL,
+    source_hash character(64) NOT NULL,
+    idempotency_key character varying(255) NOT NULL,
+    status character varying(30) DEFAULT 'PENDING'::character varying NOT NULL,
+    item_count integer DEFAULT 0 NOT NULL,
+    matched_count integer DEFAULT 0 NOT NULL,
+    exception_count integer DEFAULT 0 NOT NULL,
+    worker_id character varying(100),
+    lease_expires_at timestamp with time zone,
+    retry_count integer DEFAULT 0 NOT NULL,
+    last_error text,
+    raw_evidence_expires_at timestamp with time zone DEFAULT (now() + '30 days'::interval) NOT NULL,
+    financial_record_retain_until timestamp with time zone DEFAULT (now() + '7 years'::interval) NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    completed_at timestamp with time zone,
+    CONSTRAINT chk_reconciliation_period CHECK ((period_end > period_start)),
+    CONSTRAINT payment_reconciliation_runs_exception_count_check CHECK ((exception_count >= 0)),
+    CONSTRAINT payment_reconciliation_runs_item_count_check CHECK ((item_count >= 0)),
+    CONSTRAINT payment_reconciliation_runs_matched_count_check CHECK ((matched_count >= 0)),
+    CONSTRAINT payment_reconciliation_runs_retry_count_check CHECK ((retry_count >= 0)),
+    CONSTRAINT payment_reconciliation_runs_status_check CHECK (((status)::text = ANY (ARRAY[('PENDING'::character varying)::text, ('PROCESSING'::character varying)::text, ('COMPLETED'::character varying)::text, ('FAILED'::character varying)::text, ('DEAD_LETTER'::character varying)::text])))
+);
+
+ALTER TABLE ONLY public.payment_reconciliation_runs FORCE ROW LEVEL SECURITY;
+
+
+--
+-- Name: payment_reversal_history; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.payment_reversal_history (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    reversal_id uuid NOT NULL,
+    previous_status public.reversal_status_enum,
+    new_status public.reversal_status_enum NOT NULL,
+    reason text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+ALTER TABLE ONLY public.payment_reversal_history FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -1115,7 +1811,7 @@ CREATE TABLE public.payment_reversals (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     tenant_id uuid NOT NULL,
     payment_id uuid NOT NULL,
-    amount numeric(20,2) NOT NULL,
+    amount bigint NOT NULL,
     currency character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     reason text,
     status public.reversal_status_enum DEFAULT 'PENDING'::public.reversal_status_enum NOT NULL,
@@ -1123,9 +1819,84 @@ CREATE TABLE public.payment_reversals (
     requested_at timestamp with time zone DEFAULT now() NOT NULL,
     completed_at timestamp with time zone,
     created_by uuid,
-    CONSTRAINT chk_reversal_amount CHECK ((amount > (0)::numeric)),
+    idempotency_key character varying(255),
+    request_hash character(64),
+    original_ledger_transaction_id uuid,
+    reversal_ledger_transaction_id uuid,
+    approval_id uuid,
+    automated_rule_id character varying(100),
+    failure_code character varying(100),
+    failure_reason text,
+    CONSTRAINT chk_reversal_amount CHECK (((amount)::numeric > (0)::numeric)),
+    CONSTRAINT chk_reversal_authority CHECK (((((approval_id IS NOT NULL))::integer + ((automated_rule_id IS NOT NULL))::integer) = 1)),
     CONSTRAINT chk_reversal_currency CHECK ((currency ~ '^[A-Z]{3}$'::text))
 );
+
+ALTER TABLE ONLY public.payment_reversals FORCE ROW LEVEL SECURITY;
+
+
+--
+-- Name: payment_service_payout_attempts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.payment_service_payout_attempts (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    payout_id uuid NOT NULL,
+    attempt_number integer NOT NULL,
+    provider_code character varying(100) NOT NULL,
+    provider_reference character varying(255),
+    submission_state character varying(30) NOT NULL,
+    outcome_certainty character varying(20) NOT NULL,
+    request_hash character(64) NOT NULL,
+    evidence_hash character(64),
+    next_inquiry_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    completed_at timestamp with time zone,
+    retention_until date DEFAULT (CURRENT_DATE + 2557) NOT NULL,
+    legal_hold boolean DEFAULT false NOT NULL,
+    CONSTRAINT payment_service_payout_attempts_attempt_number_check CHECK ((attempt_number > 0)),
+    CONSTRAINT payment_service_payout_attempts_outcome_certainty_check CHECK (((outcome_certainty)::text = ANY ((ARRAY['CERTAIN'::character varying, 'AMBIGUOUS'::character varying])::text[])))
+);
+
+ALTER TABLE ONLY public.payment_service_payout_attempts FORCE ROW LEVEL SECURITY;
+
+
+--
+-- Name: payment_service_payouts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.payment_service_payouts (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    source_service character varying(100) NOT NULL,
+    source_resource_id uuid NOT NULL,
+    customer_id uuid NOT NULL,
+    ledger_transaction_id uuid NOT NULL,
+    destination_reference character varying(255) NOT NULL,
+    amount bigint NOT NULL,
+    currency character(3) NOT NULL,
+    narration character varying(140) NOT NULL,
+    status character varying(30) DEFAULT 'CREATED'::character varying NOT NULL,
+    routing_decision_id uuid,
+    active_attempt_id uuid,
+    idempotency_key character varying(255) NOT NULL,
+    request_hash character(64) NOT NULL,
+    correlation_id uuid NOT NULL,
+    next_inquiry_at timestamp with time zone,
+    failure_code character varying(100),
+    failure_reason text,
+    completed_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    retention_until date DEFAULT (CURRENT_DATE + 2557) NOT NULL,
+    legal_hold boolean DEFAULT false NOT NULL,
+    CONSTRAINT payment_service_payouts_amount_check CHECK ((amount > 0)),
+    CONSTRAINT payment_service_payouts_currency_check CHECK ((currency = 'NGN'::bpchar)),
+    CONSTRAINT payment_service_payouts_status_check CHECK (((status)::text = ANY ((ARRAY['CREATED'::character varying, 'SUBMITTING'::character varying, 'PENDING'::character varying, 'SUCCEEDED'::character varying, 'FAILED'::character varying, 'REVERSED'::character varying, 'MANUAL_REVIEW'::character varying])::text[])))
+);
+
+ALTER TABLE ONLY public.payment_service_payouts FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -1140,7 +1911,7 @@ CREATE TABLE public.payment_transactions (
     beneficiary_id uuid,
     payment_type public.payment_type_enum NOT NULL,
     channel public.payment_channel_enum NOT NULL,
-    amount numeric(20,2) NOT NULL,
+    amount bigint NOT NULL,
     currency character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     status public.payment_status_enum DEFAULT 'PENDING'::public.payment_status_enum NOT NULL,
     reference character varying(100) NOT NULL,
@@ -1163,10 +1934,12 @@ CREATE TABLE public.payment_transactions (
     created_by uuid,
     updated_by uuid,
     deleted_at timestamp with time zone,
-    CONSTRAINT chk_payment_amount CHECK ((amount > (0)::numeric)),
+    CONSTRAINT chk_payment_amount CHECK (((amount)::numeric > (0)::numeric)),
     CONSTRAINT chk_payment_currency CHECK ((currency ~ '^[A-Z]{3}$'::text)),
     CONSTRAINT chk_payment_customer_scope CHECK (((customer_id IS NOT NULL) OR (payment_type = ANY (ARRAY['PAYOUT'::public.payment_type_enum, 'PLATFORM_REVENUE_SETTLEMENT'::public.payment_type_enum, 'PLATFORM_REVENUE_REFUND'::public.payment_type_enum]))))
 );
+
+ALTER TABLE ONLY public.payment_transactions FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -1178,14 +1951,26 @@ CREATE TABLE public.payment_webhooks (
     tenant_id uuid,
     provider_code character varying(50) NOT NULL,
     event_type character varying(100) NOT NULL,
-    event_reference character varying(200),
+    event_reference character varying(200) NOT NULL,
     payload jsonb NOT NULL,
-    signature character varying(500),
     status public.webhook_status_enum DEFAULT 'RECEIVED'::public.webhook_status_enum NOT NULL,
     received_at timestamp with time zone DEFAULT now() NOT NULL,
     processed_at timestamp with time zone,
-    processing_error text
+    processing_error text,
+    payload_hash character(64) NOT NULL,
+    signature_verified boolean DEFAULT false NOT NULL,
+    signature_hash character(64),
+    processing_attempts integer DEFAULT 0 NOT NULL,
+    processing_started_at timestamp with time zone,
+    lease_expires_at timestamp with time zone,
+    last_attempt_at timestamp with time zone,
+    expires_at timestamp with time zone DEFAULT (now() + '30 days'::interval) NOT NULL,
+    signature_scheme character varying(50) NOT NULL,
+    credential_key_version character varying(100) NOT NULL,
+    CONSTRAINT payment_webhooks_processing_attempts_check CHECK ((processing_attempts >= 0))
 );
+
+ALTER TABLE ONLY public.payment_webhooks FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -1197,7 +1982,7 @@ CREATE TABLE public.platform_revenue_adjustments (
     tenant_id uuid NOT NULL,
     revenue_event_id uuid NOT NULL,
     adjustment_type public.revenue_adjustment_type_enum NOT NULL,
-    amount numeric(20,2) NOT NULL,
+    amount bigint NOT NULL,
     currency character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     reason_code character varying(100),
     reason text NOT NULL,
@@ -1206,9 +1991,11 @@ CREATE TABLE public.platform_revenue_adjustments (
     idempotency_key character varying(255) NOT NULL,
     created_by uuid,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT chk_platform_revenue_adjustment_amount CHECK ((amount > (0)::numeric)),
+    CONSTRAINT chk_platform_revenue_adjustment_amount CHECK (((amount)::numeric > (0)::numeric)),
     CONSTRAINT chk_platform_revenue_adjustment_currency CHECK ((currency ~ '^[A-Z]{3}$'::text))
 );
+
+ALTER TABLE ONLY public.platform_revenue_adjustments FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -1239,13 +2026,13 @@ CREATE TABLE public.platform_revenue_events (
     commercial_agreement_id uuid,
     revenue_share_rule_id uuid,
     calculation_basis character varying(100) NOT NULL,
-    basis_amount numeric(20,2) NOT NULL,
+    basis_amount bigint NOT NULL,
     percentage_rate numeric(12,6),
-    fixed_amount numeric(20,2),
-    gross_revenue_amount numeric(20,2) NOT NULL,
-    fee_amount numeric(20,2) DEFAULT 0 NOT NULL,
-    tax_amount numeric(20,2) DEFAULT 0 NOT NULL,
-    net_revenue_amount numeric(20,2) NOT NULL,
+    fixed_amount bigint,
+    gross_revenue_amount bigint NOT NULL,
+    fee_amount bigint DEFAULT 0 NOT NULL,
+    tax_amount bigint DEFAULT 0 NOT NULL,
+    net_revenue_amount bigint NOT NULL,
     currency character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     status public.platform_revenue_status_enum DEFAULT 'CALCULATED'::public.platform_revenue_status_enum NOT NULL,
     settlement_status public.platform_revenue_settlement_status_enum DEFAULT 'UNSETTLED'::public.platform_revenue_settlement_status_enum NOT NULL,
@@ -1265,15 +2052,17 @@ CREATE TABLE public.platform_revenue_events (
     metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT chk_platform_revenue_amounts CHECK (((gross_revenue_amount >= (0)::numeric) AND (fee_amount >= (0)::numeric) AND (tax_amount >= (0)::numeric) AND (net_revenue_amount >= (0)::numeric) AND (net_revenue_amount = ((gross_revenue_amount - fee_amount) - tax_amount)))),
-    CONSTRAINT chk_platform_revenue_basis_amount CHECK ((basis_amount >= (0)::numeric)),
+    CONSTRAINT chk_platform_revenue_amounts CHECK ((((gross_revenue_amount)::numeric >= (0)::numeric) AND ((fee_amount)::numeric >= (0)::numeric) AND ((tax_amount)::numeric >= (0)::numeric) AND ((net_revenue_amount)::numeric >= (0)::numeric) AND ((net_revenue_amount)::numeric = (((gross_revenue_amount)::numeric - (fee_amount)::numeric) - (tax_amount)::numeric)))),
+    CONSTRAINT chk_platform_revenue_basis_amount CHECK (((basis_amount)::numeric >= (0)::numeric)),
     CONSTRAINT chk_platform_revenue_currency CHECK ((currency ~ '^[A-Z]{3}$'::text)),
     CONSTRAINT chk_platform_revenue_earned_at CHECK (((status <> 'EARNED'::public.platform_revenue_status_enum) OR (earned_at IS NOT NULL))),
-    CONSTRAINT chk_platform_revenue_fixed CHECK (((fixed_amount IS NULL) OR (fixed_amount >= (0)::numeric))),
+    CONSTRAINT chk_platform_revenue_fixed CHECK (((fixed_amount IS NULL) OR ((fixed_amount)::numeric >= (0)::numeric))),
     CONSTRAINT chk_platform_revenue_percentage CHECK (((percentage_rate IS NULL) OR ((percentage_rate >= (0)::numeric) AND (percentage_rate <= (100)::numeric)))),
     CONSTRAINT chk_platform_revenue_reversal CHECK (((status <> 'REVERSED'::public.platform_revenue_status_enum) OR ((reversed_by_event_id IS NOT NULL) AND (reversed_at IS NOT NULL)))),
     CONSTRAINT chk_platform_revenue_reversal_links CHECK (((reversal_of_event_id IS NULL) OR (reversal_of_event_id <> id)))
 );
+
+ALTER TABLE ONLY public.platform_revenue_events FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -1306,12 +2095,14 @@ CREATE TABLE public.platform_revenue_settlement_items (
     tenant_id uuid NOT NULL,
     settlement_id uuid NOT NULL,
     revenue_event_id uuid NOT NULL,
-    amount numeric(20,2) NOT NULL,
+    amount bigint NOT NULL,
     currency character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT chk_platform_revenue_settlement_item_amount CHECK ((amount > (0)::numeric)),
+    CONSTRAINT chk_platform_revenue_settlement_item_amount CHECK (((amount)::numeric > (0)::numeric)),
     CONSTRAINT chk_platform_revenue_settlement_item_currency CHECK ((currency ~ '^[A-Z]{3}$'::text))
 );
+
+ALTER TABLE ONLY public.platform_revenue_settlement_items FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -1332,11 +2123,11 @@ CREATE TABLE public.platform_revenue_settlements (
     currency character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     period_start timestamp with time zone NOT NULL,
     period_end timestamp with time zone NOT NULL,
-    gross_revenue_amount numeric(20,2) DEFAULT 0 NOT NULL,
-    adjustment_amount numeric(20,2) DEFAULT 0 NOT NULL,
-    settlement_fee_amount numeric(20,2) DEFAULT 0 NOT NULL,
-    tax_amount numeric(20,2) DEFAULT 0 NOT NULL,
-    net_settlement_amount numeric(20,2) DEFAULT 0 NOT NULL,
+    gross_revenue_amount bigint DEFAULT 0 NOT NULL,
+    adjustment_amount bigint DEFAULT 0 NOT NULL,
+    settlement_fee_amount bigint DEFAULT 0 NOT NULL,
+    tax_amount bigint DEFAULT 0 NOT NULL,
+    net_settlement_amount bigint DEFAULT 0 NOT NULL,
     fee_bearer public.fee_bearer_enum DEFAULT 'TENANT'::public.fee_bearer_enum NOT NULL,
     status public.revenue_settlement_status_enum DEFAULT 'PENDING'::public.revenue_settlement_status_enum NOT NULL,
     settlement_configuration_id uuid,
@@ -1364,12 +2155,14 @@ CREATE TABLE public.platform_revenue_settlements (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     created_by uuid,
     updated_by uuid,
-    CONSTRAINT chk_platform_revenue_settlement_amounts CHECK (((gross_revenue_amount >= (0)::numeric) AND (settlement_fee_amount >= (0)::numeric) AND (tax_amount >= (0)::numeric) AND (net_settlement_amount >= (0)::numeric) AND (net_settlement_amount = (((gross_revenue_amount + adjustment_amount) - settlement_fee_amount) - tax_amount)))),
+    CONSTRAINT chk_platform_revenue_settlement_amounts CHECK ((((gross_revenue_amount)::numeric >= (0)::numeric) AND ((settlement_fee_amount)::numeric >= (0)::numeric) AND ((tax_amount)::numeric >= (0)::numeric) AND ((net_settlement_amount)::numeric >= (0)::numeric) AND ((net_settlement_amount)::numeric = ((((gross_revenue_amount)::numeric + (adjustment_amount)::numeric) - (settlement_fee_amount)::numeric) - (tax_amount)::numeric)))),
     CONSTRAINT chk_platform_revenue_settlement_completion CHECK (((status <> 'SETTLED'::public.revenue_settlement_status_enum) OR ((payment_id IS NOT NULL) AND (completed_at IS NOT NULL)))),
     CONSTRAINT chk_platform_revenue_settlement_currency CHECK ((currency ~ '^[A-Z]{3}$'::text)),
     CONSTRAINT chk_platform_revenue_settlement_period CHECK ((period_end >= period_start)),
     CONSTRAINT chk_platform_revenue_settlement_retry CHECK ((retry_count >= 0))
 );
+
+ALTER TABLE ONLY public.platform_revenue_settlements FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -1401,19 +2194,21 @@ CREATE TABLE public.platform_revenue_shares (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     tenant_id uuid NOT NULL,
     revenue_event_id uuid NOT NULL,
-    share_basis_amount numeric(20,2) NOT NULL,
+    share_basis_amount bigint NOT NULL,
     parc_share_rate numeric(12,6) NOT NULL,
-    parc_share_amount numeric(20,2) NOT NULL,
-    tenant_retained_amount numeric(20,2),
-    provider_share_amount numeric(20,2) DEFAULT 0 NOT NULL,
-    partner_share_amount numeric(20,2) DEFAULT 0 NOT NULL,
+    parc_share_amount bigint NOT NULL,
+    tenant_retained_amount bigint,
+    provider_share_amount bigint DEFAULT 0 NOT NULL,
+    partner_share_amount bigint DEFAULT 0 NOT NULL,
     currency character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT chk_platform_revenue_share_amounts CHECK (((parc_share_amount >= (0)::numeric) AND ((tenant_retained_amount IS NULL) OR (tenant_retained_amount >= (0)::numeric)) AND (provider_share_amount >= (0)::numeric) AND (partner_share_amount >= (0)::numeric))),
-    CONSTRAINT chk_platform_revenue_share_basis CHECK ((share_basis_amount >= (0)::numeric)),
+    CONSTRAINT chk_platform_revenue_share_amounts CHECK ((((parc_share_amount)::numeric >= (0)::numeric) AND ((tenant_retained_amount IS NULL) OR ((tenant_retained_amount)::numeric >= (0)::numeric)) AND ((provider_share_amount)::numeric >= (0)::numeric) AND ((partner_share_amount)::numeric >= (0)::numeric))),
+    CONSTRAINT chk_platform_revenue_share_basis CHECK (((share_basis_amount)::numeric >= (0)::numeric)),
     CONSTRAINT chk_platform_revenue_share_currency CHECK ((currency ~ '^[A-Z]{3}$'::text)),
     CONSTRAINT chk_platform_revenue_share_rate CHECK (((parc_share_rate >= (0)::numeric) AND (parc_share_rate <= (100)::numeric)))
 );
+
+ALTER TABLE ONLY public.platform_revenue_shares FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -1421,6 +2216,36 @@ CREATE TABLE public.platform_revenue_shares (
 --
 
 COMMENT ON TABLE public.platform_revenue_shares IS 'One-to-one revenue-share economics for platform_revenue_events whose revenue_model is REVENUE_SHARE.';
+
+
+--
+-- Name: virtual_account_provisioning_requests; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.virtual_account_provisioning_requests (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    customer_id uuid NOT NULL,
+    financial_account_id uuid NOT NULL,
+    routing_decision_id uuid NOT NULL,
+    provider_code character varying(50) NOT NULL,
+    currency character(3) NOT NULL,
+    idempotency_key character varying(255) NOT NULL,
+    request_hash character(64) NOT NULL,
+    status character varying(30) DEFAULT 'PENDING'::character varying NOT NULL,
+    provider_customer_reference character varying(200),
+    provider_account_reference character varying(200),
+    failure_code character varying(100),
+    failure_reason text,
+    submitted_at timestamp with time zone,
+    completed_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT chk_va_currency CHECK ((currency ~ '^[A-Z]{3}$'::text)),
+    CONSTRAINT virtual_account_provisioning_requests_status_check CHECK (((status)::text = ANY (ARRAY[('PENDING'::character varying)::text, ('SUBMITTED'::character varying)::text, ('ACTIVE'::character varying)::text, ('FAILED'::character varying)::text, ('MANUAL_REVIEW'::character varying)::text])))
+);
+
+ALTER TABLE ONLY public.virtual_account_provisioning_requests FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -1472,6 +2297,54 @@ ALTER TABLE ONLY public.bill_categories
 
 
 --
+-- Name: bill_customer_validations bill_customer_validations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_customer_validations
+    ADD CONSTRAINT bill_customer_validations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: bill_customer_validations bill_customer_validations_tenant_id_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_customer_validations
+    ADD CONSTRAINT bill_customer_validations_tenant_id_id_key UNIQUE (tenant_id, id);
+
+
+--
+-- Name: bill_customer_validations bill_customer_validations_tenant_id_idempotency_key_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_customer_validations
+    ADD CONSTRAINT bill_customer_validations_tenant_id_idempotency_key_key UNIQUE (tenant_id, idempotency_key);
+
+
+--
+-- Name: bill_payment_quotes bill_payment_quotes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_payment_quotes
+    ADD CONSTRAINT bill_payment_quotes_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: bill_payment_quotes bill_payment_quotes_tenant_id_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_payment_quotes
+    ADD CONSTRAINT bill_payment_quotes_tenant_id_id_key UNIQUE (tenant_id, id);
+
+
+--
+-- Name: bill_payment_quotes bill_payment_quotes_tenant_id_idempotency_key_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_payment_quotes
+    ADD CONSTRAINT bill_payment_quotes_tenant_id_idempotency_key_key UNIQUE (tenant_id, idempotency_key);
+
+
+--
 -- Name: bill_products bill_products_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1501,6 +2374,14 @@ ALTER TABLE ONLY public.bill_providers
 
 ALTER TABLE ONLY public.bill_transaction_attempts
     ADD CONSTRAINT bill_transaction_attempts_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: bill_transaction_status_history bill_transaction_status_history_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_transaction_status_history
+    ADD CONSTRAINT bill_transaction_status_history_pkey PRIMARY KEY (id);
 
 
 --
@@ -1536,11 +2417,43 @@ ALTER TABLE ONLY public.payment_attempts
 
 
 --
+-- Name: payment_collection_status_history payment_collection_status_history_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_collection_status_history
+    ADD CONSTRAINT payment_collection_status_history_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: payment_collections payment_collections_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_collections
+    ADD CONSTRAINT payment_collections_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: payment_disputes payment_disputes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.payment_disputes
     ADD CONSTRAINT payment_disputes_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: payment_external_transfer_history payment_external_transfer_history_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_external_transfer_history
+    ADD CONSTRAINT payment_external_transfer_history_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: payment_external_transfers payment_external_transfers_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_external_transfers
+    ADD CONSTRAINT payment_external_transfers_pkey PRIMARY KEY (id);
 
 
 --
@@ -1560,6 +2473,22 @@ ALTER TABLE ONLY public.payment_idempotency_keys
 
 
 --
+-- Name: payment_internal_transfer_history payment_internal_transfer_history_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_internal_transfer_history
+    ADD CONSTRAINT payment_internal_transfer_history_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: payment_internal_transfers payment_internal_transfers_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_internal_transfers
+    ADD CONSTRAINT payment_internal_transfers_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: payment_outbox_events payment_outbox_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1573,6 +2502,14 @@ ALTER TABLE ONLY public.payment_outbox_events
 
 ALTER TABLE ONLY public.payment_parties
     ADD CONSTRAINT payment_parties_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: payment_provider_routing_decisions payment_provider_routing_decisions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_provider_routing_decisions
+    ADD CONSTRAINT payment_provider_routing_decisions_pkey PRIMARY KEY (id);
 
 
 --
@@ -1592,11 +2529,83 @@ ALTER TABLE ONLY public.payment_reconciliation_records
 
 
 --
+-- Name: payment_reconciliation_runs payment_reconciliation_runs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_reconciliation_runs
+    ADD CONSTRAINT payment_reconciliation_runs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: payment_reversal_history payment_reversal_history_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_reversal_history
+    ADD CONSTRAINT payment_reversal_history_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: payment_reversals payment_reversals_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.payment_reversals
     ADD CONSTRAINT payment_reversals_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: payment_service_payout_attempts payment_service_payout_attemp_tenant_id_payout_id_attempt_n_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_service_payout_attempts
+    ADD CONSTRAINT payment_service_payout_attemp_tenant_id_payout_id_attempt_n_key UNIQUE (tenant_id, payout_id, attempt_number);
+
+
+--
+-- Name: payment_service_payout_attempts payment_service_payout_attempts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_service_payout_attempts
+    ADD CONSTRAINT payment_service_payout_attempts_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: payment_service_payout_attempts payment_service_payout_attempts_tenant_id_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_service_payout_attempts
+    ADD CONSTRAINT payment_service_payout_attempts_tenant_id_id_key UNIQUE (tenant_id, id);
+
+
+--
+-- Name: payment_service_payouts payment_service_payouts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_service_payouts
+    ADD CONSTRAINT payment_service_payouts_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: payment_service_payouts payment_service_payouts_tenant_id_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_service_payouts
+    ADD CONSTRAINT payment_service_payouts_tenant_id_id_key UNIQUE (tenant_id, id);
+
+
+--
+-- Name: payment_service_payouts payment_service_payouts_tenant_id_idempotency_key_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_service_payouts
+    ADD CONSTRAINT payment_service_payouts_tenant_id_idempotency_key_key UNIQUE (tenant_id, idempotency_key);
+
+
+--
+-- Name: payment_service_payouts payment_service_payouts_tenant_id_source_service_source_res_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_service_payouts
+    ADD CONSTRAINT payment_service_payouts_tenant_id_source_service_source_res_key UNIQUE (tenant_id, source_service, source_resource_id);
 
 
 --
@@ -1664,6 +2673,22 @@ ALTER TABLE ONLY public.account_providers
 
 
 --
+-- Name: account_providers uq_account_provider_tenant_id; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.account_providers
+    ADD CONSTRAINT uq_account_provider_tenant_id UNIQUE (tenant_id, id);
+
+
+--
+-- Name: beneficiaries uq_beneficiary_tenant_id; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.beneficiaries
+    ADD CONSTRAINT uq_beneficiary_tenant_id UNIQUE (tenant_id, id);
+
+
+--
 -- Name: bill_transaction_attempts uq_bill_attempt_number; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1672,11 +2697,19 @@ ALTER TABLE ONLY public.bill_transaction_attempts
 
 
 --
--- Name: bill_products uq_bill_product; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: bill_products uq_bill_product_tenant_id; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.bill_products
-    ADD CONSTRAINT uq_bill_product UNIQUE (provider_id, product_code);
+    ADD CONSTRAINT uq_bill_product_tenant_id UNIQUE (tenant_id, id);
+
+
+--
+-- Name: bill_products uq_bill_product_version; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_products
+    ADD CONSTRAINT uq_bill_product_version UNIQUE (tenant_id, provider_id, product_code, catalogue_version);
 
 
 --
@@ -1688,11 +2721,27 @@ ALTER TABLE ONLY public.bill_providers
 
 
 --
+-- Name: bill_providers uq_bill_provider_tenant_id; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_providers
+    ADD CONSTRAINT uq_bill_provider_tenant_id UNIQUE (tenant_id, id);
+
+
+--
 -- Name: bill_provider_transactions uq_bill_provider_transaction; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.bill_provider_transactions
     ADD CONSTRAINT uq_bill_provider_transaction UNIQUE (provider_code, provider_transaction_id);
+
+
+--
+-- Name: bill_transactions uq_bill_transaction_idempotency; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_transactions
+    ADD CONSTRAINT uq_bill_transaction_idempotency UNIQUE (tenant_id, idempotency_key);
 
 
 --
@@ -1704,11 +2753,75 @@ ALTER TABLE ONLY public.bill_transactions
 
 
 --
+-- Name: bill_transactions uq_bill_transaction_tenant_id; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_transactions
+    ADD CONSTRAINT uq_bill_transaction_tenant_id UNIQUE (tenant_id, id);
+
+
+--
 -- Name: bill_webhooks uq_bill_webhook_event; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.bill_webhooks
     ADD CONSTRAINT uq_bill_webhook_event UNIQUE (provider_code, event_reference);
+
+
+--
+-- Name: payment_collections uq_collection_ledger_idempotency; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_collections
+    ADD CONSTRAINT uq_collection_ledger_idempotency UNIQUE (tenant_id, ledger_idempotency_key);
+
+
+--
+-- Name: payment_collections uq_collection_provider_reference; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_collections
+    ADD CONSTRAINT uq_collection_provider_reference UNIQUE (provider_code, provider_reference);
+
+
+--
+-- Name: payment_collections uq_collection_tenant_id; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_collections
+    ADD CONSTRAINT uq_collection_tenant_id UNIQUE (tenant_id, id);
+
+
+--
+-- Name: payment_collections uq_collection_webhook; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_collections
+    ADD CONSTRAINT uq_collection_webhook UNIQUE (webhook_id);
+
+
+--
+-- Name: payment_external_transfers uq_external_idempotency; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_external_transfers
+    ADD CONSTRAINT uq_external_idempotency UNIQUE (tenant_id, idempotency_key);
+
+
+--
+-- Name: payment_external_transfers uq_external_payment; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_external_transfers
+    ADD CONSTRAINT uq_external_payment UNIQUE (tenant_id, payment_id);
+
+
+--
+-- Name: payment_external_transfers uq_external_tenant_id; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_external_transfers
+    ADD CONSTRAINT uq_external_tenant_id UNIQUE (tenant_id, id);
 
 
 --
@@ -1728,11 +2841,51 @@ ALTER TABLE ONLY public.financial_accounts
 
 
 --
+-- Name: financial_accounts uq_financial_account_tenant_id; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.financial_accounts
+    ADD CONSTRAINT uq_financial_account_tenant_id UNIQUE (tenant_id, id);
+
+
+--
+-- Name: payment_internal_transfers uq_internal_transfer_idempotency; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_internal_transfers
+    ADD CONSTRAINT uq_internal_transfer_idempotency UNIQUE (tenant_id, idempotency_key);
+
+
+--
+-- Name: payment_internal_transfers uq_internal_transfer_payment; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_internal_transfers
+    ADD CONSTRAINT uq_internal_transfer_payment UNIQUE (tenant_id, payment_id);
+
+
+--
+-- Name: payment_internal_transfers uq_internal_transfer_tenant_id; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_internal_transfers
+    ADD CONSTRAINT uq_internal_transfer_tenant_id UNIQUE (tenant_id, id);
+
+
+--
 -- Name: payment_attempts uq_payment_attempt_number; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.payment_attempts
     ADD CONSTRAINT uq_payment_attempt_number UNIQUE (payment_id, attempt_number);
+
+
+--
+-- Name: payment_attempts uq_payment_attempt_tenant_id; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_attempts
+    ADD CONSTRAINT uq_payment_attempt_tenant_id UNIQUE (tenant_id, id);
 
 
 --
@@ -1760,11 +2913,59 @@ ALTER TABLE ONLY public.payment_outbox_events
 
 
 --
+-- Name: payment_outbox_events uq_payment_outbox_tenant_idempotency; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_outbox_events
+    ADD CONSTRAINT uq_payment_outbox_tenant_idempotency UNIQUE (tenant_id, idempotency_key);
+
+
+--
 -- Name: payment_transactions uq_payment_reference; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.payment_transactions
     ADD CONSTRAINT uq_payment_reference UNIQUE (tenant_id, reference);
+
+
+--
+-- Name: payment_reversals uq_payment_reversal_idempotency; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_reversals
+    ADD CONSTRAINT uq_payment_reversal_idempotency UNIQUE (tenant_id, idempotency_key);
+
+
+--
+-- Name: payment_reversals uq_payment_reversal_tenant_id; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_reversals
+    ADD CONSTRAINT uq_payment_reversal_tenant_id UNIQUE (tenant_id, id);
+
+
+--
+-- Name: payment_provider_routing_decisions uq_payment_routing_idempotency; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_provider_routing_decisions
+    ADD CONSTRAINT uq_payment_routing_idempotency UNIQUE (tenant_id, idempotency_key);
+
+
+--
+-- Name: payment_provider_routing_decisions uq_payment_routing_tenant_id; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_provider_routing_decisions
+    ADD CONSTRAINT uq_payment_routing_tenant_id UNIQUE (tenant_id, id);
+
+
+--
+-- Name: payment_transactions uq_payment_transaction_tenant_id; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_transactions
+    ADD CONSTRAINT uq_payment_transaction_tenant_id UNIQUE (tenant_id, id);
 
 
 --
@@ -1872,11 +3073,75 @@ ALTER TABLE ONLY public.account_provider_accounts
 
 
 --
+-- Name: payment_provider_transactions uq_provider_payment_tenant_id; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_provider_transactions
+    ADD CONSTRAINT uq_provider_payment_tenant_id UNIQUE (tenant_id, id);
+
+
+--
 -- Name: payment_provider_transactions uq_provider_transaction; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.payment_provider_transactions
     ADD CONSTRAINT uq_provider_transaction UNIQUE (provider_code, provider_transaction_id);
+
+
+--
+-- Name: payment_reconciliation_runs uq_reconciliation_run_idempotency; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_reconciliation_runs
+    ADD CONSTRAINT uq_reconciliation_run_idempotency UNIQUE (tenant_id, idempotency_key);
+
+
+--
+-- Name: payment_reconciliation_runs uq_reconciliation_run_tenant_id; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_reconciliation_runs
+    ADD CONSTRAINT uq_reconciliation_run_tenant_id UNIQUE (tenant_id, id);
+
+
+--
+-- Name: payment_reconciliation_runs uq_reconciliation_source; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_reconciliation_runs
+    ADD CONSTRAINT uq_reconciliation_source UNIQUE (tenant_id, provider_code, source_hash);
+
+
+--
+-- Name: payment_reversals uq_reversal_original_ledger; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_reversals
+    ADD CONSTRAINT uq_reversal_original_ledger UNIQUE (tenant_id, original_ledger_transaction_id);
+
+
+--
+-- Name: virtual_account_provisioning_requests uq_va_idempotency; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.virtual_account_provisioning_requests
+    ADD CONSTRAINT uq_va_idempotency UNIQUE (tenant_id, idempotency_key);
+
+
+--
+-- Name: virtual_account_provisioning_requests uq_va_tenant_id; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.virtual_account_provisioning_requests
+    ADD CONSTRAINT uq_va_tenant_id UNIQUE (tenant_id, id);
+
+
+--
+-- Name: virtual_account_provisioning_requests virtual_account_provisioning_requests_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.virtual_account_provisioning_requests
+    ADD CONSTRAINT virtual_account_provisioning_requests_pkey PRIMARY KEY (id);
 
 
 --
@@ -1898,6 +3163,13 @@ CREATE INDEX idx_account_providers_tenant ON public.account_providers USING btre
 --
 
 CREATE INDEX idx_account_status_history_account ON public.account_status_history USING btree (account_id, created_at DESC);
+
+
+--
+-- Name: idx_attempt_inquiry_due; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_attempt_inquiry_due ON public.payment_attempts USING btree (next_inquiry_at) WHERE ((outcome_class)::text = ANY (ARRAY[('ACKNOWLEDGED_PENDING'::character varying)::text, ('AMBIGUOUS'::character varying)::text]));
 
 
 --
@@ -1926,6 +3198,13 @@ CREATE INDEX idx_bill_attempts_provider_reference ON public.bill_transaction_att
 --
 
 CREATE INDEX idx_bill_attempts_transaction ON public.bill_transaction_attempts USING btree (bill_transaction_id);
+
+
+--
+-- Name: idx_bill_inquiry_due; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_bill_inquiry_due ON public.bill_transaction_attempts USING btree (next_inquiry_at, inquiry_lease_expires_at) WHERE ((outcome_class)::text = ANY ((ARRAY['ACKNOWLEDGED_PENDING'::character varying, 'AMBIGUOUS'::character varying])::text[]));
 
 
 --
@@ -2020,6 +3299,20 @@ CREATE INDEX idx_bill_webhooks_status ON public.bill_webhooks USING btree (statu
 
 
 --
+-- Name: idx_collection_posting_recovery; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_collection_posting_recovery ON public.payment_collections USING btree (status, created_at) WHERE ((status)::text = ANY (ARRAY[('VERIFIED'::character varying)::text, ('POSTING'::character varying)::text, ('MANUAL_REVIEW'::character varying)::text]));
+
+
+--
+-- Name: idx_external_recovery; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_external_recovery ON public.payment_external_transfers USING btree (status, updated_at) WHERE ((status)::text = ANY (ARRAY[('RESERVED'::character varying)::text, ('SUBMITTING'::character varying)::text, ('PENDING'::character varying)::text, ('MANUAL_REVIEW'::character varying)::text]));
+
+
+--
 -- Name: idx_financial_accounts_customer; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -2052,6 +3345,13 @@ CREATE INDEX idx_financial_accounts_status ON public.financial_accounts USING bt
 --
 
 CREATE INDEX idx_financial_accounts_tenant ON public.financial_accounts USING btree (tenant_id);
+
+
+--
+-- Name: idx_internal_transfer_recovery; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_internal_transfer_recovery ON public.payment_internal_transfers USING btree (status, updated_at) WHERE ((status)::text = ANY (ARRAY[('RESERVED'::character varying)::text, ('CAPTURING'::character varying)::text, ('MANUAL_REVIEW'::character varying)::text]));
 
 
 --
@@ -2230,6 +3530,20 @@ CREATE INDEX idx_payment_transactions_type ON public.payment_transactions USING 
 
 
 --
+-- Name: idx_payment_webhooks_due; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_payment_webhooks_due ON public.payment_webhooks USING btree (status, received_at) WHERE (status = ANY (ARRAY['RECEIVED'::public.webhook_status_enum, 'FAILED'::public.webhook_status_enum]));
+
+
+--
+-- Name: idx_payment_webhooks_expiry; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_payment_webhooks_expiry ON public.payment_webhooks USING btree (expires_at);
+
+
+--
 -- Name: idx_payment_webhooks_received; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -2370,6 +3684,69 @@ CREATE INDEX idx_provider_payment_reference ON public.payment_provider_transacti
 
 
 --
+-- Name: idx_reconciliation_run_claim; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_reconciliation_run_claim ON public.payment_reconciliation_runs USING btree (status, lease_expires_at, created_at) WHERE ((status)::text = ANY (ARRAY[('PENDING'::character varying)::text, ('PROCESSING'::character varying)::text]));
+
+
+--
+-- Name: idx_service_payout_inquiry; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_service_payout_inquiry ON public.payment_service_payouts USING btree (status, next_inquiry_at) WHERE ((status)::text = ANY ((ARRAY['PENDING'::character varying, 'MANUAL_REVIEW'::character varying])::text[]));
+
+
+--
+-- Name: idx_va_provisioning_recovery; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_va_provisioning_recovery ON public.virtual_account_provisioning_requests USING btree (status, created_at) WHERE ((status)::text = ANY (ARRAY[('PENDING'::character varying)::text, ('SUBMITTED'::character varying)::text, ('MANUAL_REVIEW'::character varying)::text]));
+
+
+--
+-- Name: uq_active_customer_currency_account; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_active_customer_currency_account ON public.financial_accounts USING btree (tenant_id, customer_id, currency) WHERE ((account_type = 'VIRTUAL_BANK_ACCOUNT'::public.account_type_enum) AND (deleted_at IS NULL) AND (status = ANY (ARRAY['PENDING'::public.account_status_enum, 'ACTIVE'::public.account_status_enum, 'SUSPENDED'::public.account_status_enum, 'FROZEN'::public.account_status_enum])));
+
+
+--
+-- Name: uq_bill_provider_reference; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_bill_provider_reference ON public.bill_transaction_attempts USING btree (provider_reference) WHERE (provider_reference IS NOT NULL);
+
+
+--
+-- Name: uq_financial_ledger_account; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_financial_ledger_account ON public.financial_accounts USING btree (ledger_account_id) WHERE (ledger_account_id IS NOT NULL);
+
+
+--
+-- Name: uq_provider_attempt_reference; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_provider_attempt_reference ON public.payment_attempts USING btree (provider_code, provider_reference) WHERE (provider_reference IS NOT NULL);
+
+
+--
+-- Name: uq_reconciliation_discrepancy; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_reconciliation_discrepancy ON public.payment_reconciliation_records USING btree (tenant_id, discrepancy_key) WHERE (discrepancy_key IS NOT NULL);
+
+
+--
+-- Name: uq_service_payout_provider_success; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_service_payout_provider_success ON public.payment_service_payout_attempts USING btree (tenant_id, payout_id) WHERE ((submission_state)::text = 'SUCCESS'::text);
+
+
+--
 -- Name: account_provider_accounts trg_account_provider_accounts_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -2426,6 +3803,13 @@ CREATE TRIGGER trg_bill_transactions_updated_at BEFORE UPDATE ON public.bill_tra
 
 
 --
+-- Name: payment_collections trg_collection_status; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_collection_status AFTER INSERT OR UPDATE OF status ON public.payment_collections FOR EACH ROW EXECUTE FUNCTION public.record_collection_status();
+
+
+--
 -- Name: platform_revenue_settlements trg_enforce_new_platform_revenue_settlement_pending; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -2433,10 +3817,33 @@ CREATE TRIGGER trg_enforce_new_platform_revenue_settlement_pending BEFORE INSERT
 
 
 --
+-- Name: payment_external_transfers trg_external_transfer_status; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_external_transfer_status AFTER INSERT OR UPDATE OF status ON public.payment_external_transfers FOR EACH ROW EXECUTE FUNCTION public.record_external_transfer_status();
+
+
+--
 -- Name: financial_accounts trg_financial_accounts_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
 CREATE TRIGGER trg_financial_accounts_updated_at BEFORE UPDATE ON public.financial_accounts FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+
+--
+-- Name: payment_provider_routing_decisions trg_immutable_payment_routing_decision; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_immutable_payment_routing_decision BEFORE DELETE OR UPDATE ON public.payment_provider_routing_decisions FOR EACH ROW EXECUTE FUNCTION public.prevent_payment_routing_decision_change();
+
+ALTER TABLE public.payment_provider_routing_decisions DISABLE TRIGGER trg_immutable_payment_routing_decision;
+
+
+--
+-- Name: payment_internal_transfers trg_internal_transfer_status; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_internal_transfer_status AFTER INSERT OR UPDATE OF status ON public.payment_internal_transfers FOR EACH ROW EXECUTE FUNCTION public.record_internal_transfer_status();
 
 
 --
@@ -2451,6 +3858,13 @@ CREATE TRIGGER trg_payment_disputes_updated_at BEFORE UPDATE ON public.payment_d
 --
 
 CREATE TRIGGER trg_payment_provider_transactions_updated_at BEFORE UPDATE ON public.payment_provider_transactions FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+
+--
+-- Name: payment_reversals trg_payment_reversal_status; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_payment_reversal_status AFTER INSERT OR UPDATE OF status ON public.payment_reversals FOR EACH ROW EXECUTE FUNCTION public.record_payment_reversal_status();
 
 
 --
@@ -2482,6 +3896,41 @@ CREATE TRIGGER trg_prevent_platform_revenue_settlement_item_delete BEFORE DELETE
 
 
 --
+-- Name: payment_attempts trg_prevent_unsafe_provider_change; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_prevent_unsafe_provider_change BEFORE INSERT ON public.payment_attempts FOR EACH ROW EXECUTE FUNCTION public.prevent_unsafe_provider_change();
+
+
+--
+-- Name: bill_transaction_status_history trg_protect_bill_history; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_protect_bill_history BEFORE DELETE OR UPDATE ON public.bill_transaction_status_history FOR EACH ROW EXECUTE FUNCTION public.protect_bill_immutable();
+
+
+--
+-- Name: bill_payment_quotes trg_protect_bill_quote; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_protect_bill_quote BEFORE DELETE OR UPDATE ON public.bill_payment_quotes FOR EACH ROW EXECUTE FUNCTION public.protect_bill_immutable();
+
+
+--
+-- Name: bill_customer_validations trg_protect_bill_validation; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_protect_bill_validation BEFORE DELETE OR UPDATE ON public.bill_customer_validations FOR EACH ROW EXECUTE FUNCTION public.protect_bill_immutable();
+
+
+--
+-- Name: payment_collection_status_history trg_protect_collection_history; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_protect_collection_history BEFORE DELETE OR UPDATE ON public.payment_collection_status_history FOR EACH ROW EXECUTE FUNCTION public.protect_collection_history();
+
+
+--
 -- Name: platform_revenue_events trg_protect_earned_platform_revenue_event; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -2489,10 +3938,87 @@ CREATE TRIGGER trg_protect_earned_platform_revenue_event BEFORE UPDATE ON public
 
 
 --
+-- Name: payment_external_transfer_history trg_protect_external_transfer_history; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_protect_external_transfer_history BEFORE DELETE OR UPDATE ON public.payment_external_transfer_history FOR EACH ROW EXECUTE FUNCTION public.protect_external_transfer_history();
+
+
+--
+-- Name: payment_internal_transfer_history trg_protect_internal_transfer_history; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_protect_internal_transfer_history BEFORE DELETE OR UPDATE ON public.payment_internal_transfer_history FOR EACH ROW EXECUTE FUNCTION public.protect_internal_transfer_history();
+
+
+--
+-- Name: payment_reversal_history trg_protect_payment_reversal_history; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_protect_payment_reversal_history BEFORE DELETE OR UPDATE ON public.payment_reversal_history FOR EACH ROW EXECUTE FUNCTION public.protect_payment_reversal_history();
+
+
+--
+-- Name: payment_webhooks trg_protect_payment_webhook_evidence; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_protect_payment_webhook_evidence BEFORE UPDATE ON public.payment_webhooks FOR EACH ROW EXECUTE FUNCTION public.protect_payment_webhook_evidence();
+
+
+--
 -- Name: platform_revenue_shares trg_protect_platform_revenue_share_economics; Type: TRIGGER; Schema: public; Owner: -
 --
 
 CREATE TRIGGER trg_protect_platform_revenue_share_economics BEFORE UPDATE ON public.platform_revenue_shares FOR EACH ROW EXECUTE FUNCTION public.protect_platform_revenue_share_economics();
+
+
+--
+-- Name: bill_products trg_protect_published_bill_product; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_protect_published_bill_product BEFORE DELETE OR UPDATE ON public.bill_products FOR EACH ROW WHEN ((old.published_at IS NOT NULL)) EXECUTE FUNCTION public.protect_bill_immutable();
+
+
+--
+-- Name: payment_attempts trg_protect_submitted_payment_attempt; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_protect_submitted_payment_attempt BEFORE INSERT OR UPDATE ON public.payment_attempts FOR EACH ROW EXECUTE FUNCTION public.protect_submitted_payment_attempt();
+
+
+--
+-- Name: bill_transactions trg_record_bill_status; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_record_bill_status AFTER INSERT OR UPDATE OF status ON public.bill_transactions FOR EACH ROW EXECUTE FUNCTION public.record_bill_status();
+
+
+--
+-- Name: bill_transactions trg_validate_bill_transaction; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_validate_bill_transaction BEFORE UPDATE ON public.bill_transactions FOR EACH ROW EXECUTE FUNCTION public.validate_bill_transaction();
+
+
+--
+-- Name: payment_external_transfers trg_validate_external_transfer; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_validate_external_transfer BEFORE INSERT OR UPDATE ON public.payment_external_transfers FOR EACH ROW EXECUTE FUNCTION public.validate_external_transfer();
+
+
+--
+-- Name: payment_internal_transfers trg_validate_internal_transfer; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_validate_internal_transfer BEFORE INSERT OR UPDATE ON public.payment_internal_transfers FOR EACH ROW EXECUTE FUNCTION public.validate_internal_transfer();
+
+
+--
+-- Name: payment_reversals trg_validate_payment_reversal; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_validate_payment_reversal BEFORE INSERT OR UPDATE ON public.payment_reversals FOR EACH ROW EXECUTE FUNCTION public.validate_payment_reversal();
 
 
 --
@@ -2517,27 +4043,98 @@ CREATE TRIGGER trg_validate_platform_revenue_share BEFORE INSERT OR UPDATE ON pu
 
 
 --
--- Name: financial_accounts fk_account_provider; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: payment_attempts trg_validate_provider_attempt_outcome; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_validate_provider_attempt_outcome BEFORE INSERT OR UPDATE ON public.payment_attempts FOR EACH ROW EXECUTE FUNCTION public.validate_provider_attempt_outcome();
+
+
+--
+-- Name: bill_customer_validations bill_customer_validations_tenant_id_product_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_customer_validations
+    ADD CONSTRAINT bill_customer_validations_tenant_id_product_id_fkey FOREIGN KEY (tenant_id, product_id) REFERENCES public.bill_products(tenant_id, id);
+
+
+--
+-- Name: bill_customer_validations bill_customer_validations_tenant_id_routing_decision_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_customer_validations
+    ADD CONSTRAINT bill_customer_validations_tenant_id_routing_decision_id_fkey FOREIGN KEY (tenant_id, routing_decision_id) REFERENCES public.payment_provider_routing_decisions(tenant_id, id);
+
+
+--
+-- Name: bill_payment_quotes bill_payment_quotes_tenant_id_product_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_payment_quotes
+    ADD CONSTRAINT bill_payment_quotes_tenant_id_product_id_fkey FOREIGN KEY (tenant_id, product_id) REFERENCES public.bill_products(tenant_id, id);
+
+
+--
+-- Name: bill_payment_quotes bill_payment_quotes_tenant_id_routing_decision_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_payment_quotes
+    ADD CONSTRAINT bill_payment_quotes_tenant_id_routing_decision_id_fkey FOREIGN KEY (tenant_id, routing_decision_id) REFERENCES public.payment_provider_routing_decisions(tenant_id, id);
+
+
+--
+-- Name: bill_payment_quotes bill_payment_quotes_tenant_id_validation_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_payment_quotes
+    ADD CONSTRAINT bill_payment_quotes_tenant_id_validation_id_fkey FOREIGN KEY (tenant_id, validation_id) REFERENCES public.bill_customer_validations(tenant_id, id);
+
+
+--
+-- Name: bill_transaction_status_history bill_transaction_status_histo_tenant_id_bill_transaction_i_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_transaction_status_history
+    ADD CONSTRAINT bill_transaction_status_histo_tenant_id_bill_transaction_i_fkey FOREIGN KEY (tenant_id, bill_transaction_id) REFERENCES public.bill_transactions(tenant_id, id);
+
+
+--
+-- Name: financial_accounts fk_account_provider_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.financial_accounts
-    ADD CONSTRAINT fk_account_provider FOREIGN KEY (provider_id) REFERENCES public.account_providers(id) ON DELETE RESTRICT;
+    ADD CONSTRAINT fk_account_provider_tenant FOREIGN KEY (tenant_id, provider_id) REFERENCES public.account_providers(tenant_id, id) ON DELETE RESTRICT;
 
 
 --
--- Name: account_status_history fk_account_status_history_account; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: account_status_history fk_account_status_history_account_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.account_status_history
-    ADD CONSTRAINT fk_account_status_history_account FOREIGN KEY (account_id) REFERENCES public.financial_accounts(id) ON DELETE RESTRICT;
+    ADD CONSTRAINT fk_account_status_history_account_tenant FOREIGN KEY (tenant_id, account_id) REFERENCES public.financial_accounts(tenant_id, id) ON DELETE RESTRICT;
 
 
 --
--- Name: bill_transaction_attempts fk_bill_attempt_transaction; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: payment_attempts fk_attempt_external_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_attempts
+    ADD CONSTRAINT fk_attempt_external_tenant FOREIGN KEY (tenant_id, external_transfer_id) REFERENCES public.payment_external_transfers(tenant_id, id);
+
+
+--
+-- Name: bill_transaction_attempts fk_bill_attempt_transaction_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.bill_transaction_attempts
-    ADD CONSTRAINT fk_bill_attempt_transaction FOREIGN KEY (bill_transaction_id) REFERENCES public.bill_transactions(id) ON DELETE RESTRICT;
+    ADD CONSTRAINT fk_bill_attempt_transaction_tenant FOREIGN KEY (tenant_id, bill_transaction_id) REFERENCES public.bill_transactions(tenant_id, id);
+
+
+--
+-- Name: bill_products fk_bill_product_category; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_products
+    ADD CONSTRAINT fk_bill_product_category FOREIGN KEY (category_id) REFERENCES public.bill_categories(id);
 
 
 --
@@ -2549,6 +4146,14 @@ ALTER TABLE ONLY public.bill_products
 
 
 --
+-- Name: bill_products fk_bill_product_provider_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_products
+    ADD CONSTRAINT fk_bill_product_provider_tenant FOREIGN KEY (tenant_id, provider_id) REFERENCES public.bill_providers(tenant_id, id);
+
+
+--
 -- Name: bill_providers fk_bill_provider_category; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -2557,11 +4162,11 @@ ALTER TABLE ONLY public.bill_providers
 
 
 --
--- Name: bill_provider_transactions fk_bill_provider_transaction; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: bill_provider_transactions fk_bill_provider_transaction_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.bill_provider_transactions
-    ADD CONSTRAINT fk_bill_provider_transaction FOREIGN KEY (bill_transaction_id) REFERENCES public.bill_transactions(id) ON DELETE RESTRICT;
+    ADD CONSTRAINT fk_bill_provider_transaction_tenant FOREIGN KEY (tenant_id, bill_transaction_id) REFERENCES public.bill_transactions(tenant_id, id);
 
 
 --
@@ -2581,11 +4186,43 @@ ALTER TABLE ONLY public.bill_transactions
 
 
 --
+-- Name: bill_transactions fk_bill_transaction_product_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_transactions
+    ADD CONSTRAINT fk_bill_transaction_product_tenant FOREIGN KEY (tenant_id, product_id) REFERENCES public.bill_products(tenant_id, id);
+
+
+--
 -- Name: bill_transactions fk_bill_transaction_provider; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.bill_transactions
     ADD CONSTRAINT fk_bill_transaction_provider FOREIGN KEY (provider_id) REFERENCES public.bill_providers(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: bill_transactions fk_bill_transaction_provider_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_transactions
+    ADD CONSTRAINT fk_bill_transaction_provider_tenant FOREIGN KEY (tenant_id, provider_id) REFERENCES public.bill_providers(tenant_id, id);
+
+
+--
+-- Name: bill_transactions fk_bill_transaction_quote_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_transactions
+    ADD CONSTRAINT fk_bill_transaction_quote_tenant FOREIGN KEY (tenant_id, quote_id) REFERENCES public.bill_payment_quotes(tenant_id, id);
+
+
+--
+-- Name: bill_transactions fk_bill_transaction_routing_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_transactions
+    ADD CONSTRAINT fk_bill_transaction_routing_tenant FOREIGN KEY (tenant_id, routing_decision_id) REFERENCES public.payment_provider_routing_decisions(tenant_id, id);
 
 
 --
@@ -2597,19 +4234,115 @@ ALTER TABLE ONLY public.bill_transactions
 
 
 --
--- Name: payment_attempts fk_payment_attempt_payment; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: bill_transactions fk_bill_transaction_source_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_transactions
+    ADD CONSTRAINT fk_bill_transaction_source_tenant FOREIGN KEY (tenant_id, source_account_id) REFERENCES public.financial_accounts(tenant_id, id);
+
+
+--
+-- Name: payment_collections fk_collection_account_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_collections
+    ADD CONSTRAINT fk_collection_account_tenant FOREIGN KEY (tenant_id, financial_account_id) REFERENCES public.financial_accounts(tenant_id, id);
+
+
+--
+-- Name: payment_collections fk_collection_payment_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_collections
+    ADD CONSTRAINT fk_collection_payment_tenant FOREIGN KEY (tenant_id, payment_id) REFERENCES public.payment_transactions(tenant_id, id);
+
+
+--
+-- Name: payment_collections fk_collection_webhook; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_collections
+    ADD CONSTRAINT fk_collection_webhook FOREIGN KEY (webhook_id) REFERENCES public.payment_webhooks(id);
+
+
+--
+-- Name: payment_external_transfers fk_external_active_attempt_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_external_transfers
+    ADD CONSTRAINT fk_external_active_attempt_tenant FOREIGN KEY (tenant_id, active_attempt_id) REFERENCES public.payment_attempts(tenant_id, id) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: payment_external_transfers fk_external_beneficiary_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_external_transfers
+    ADD CONSTRAINT fk_external_beneficiary_tenant FOREIGN KEY (tenant_id, beneficiary_id) REFERENCES public.beneficiaries(tenant_id, id);
+
+
+--
+-- Name: payment_external_transfers fk_external_payment_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_external_transfers
+    ADD CONSTRAINT fk_external_payment_tenant FOREIGN KEY (tenant_id, payment_id) REFERENCES public.payment_transactions(tenant_id, id);
+
+
+--
+-- Name: payment_external_transfers fk_external_source_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_external_transfers
+    ADD CONSTRAINT fk_external_source_tenant FOREIGN KEY (tenant_id, source_account_id) REFERENCES public.financial_accounts(tenant_id, id);
+
+
+--
+-- Name: payment_internal_transfers fk_internal_destination_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_internal_transfers
+    ADD CONSTRAINT fk_internal_destination_tenant FOREIGN KEY (tenant_id, destination_account_id) REFERENCES public.financial_accounts(tenant_id, id);
+
+
+--
+-- Name: payment_internal_transfers fk_internal_payment_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_internal_transfers
+    ADD CONSTRAINT fk_internal_payment_tenant FOREIGN KEY (tenant_id, payment_id) REFERENCES public.payment_transactions(tenant_id, id);
+
+
+--
+-- Name: payment_internal_transfers fk_internal_source_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_internal_transfers
+    ADD CONSTRAINT fk_internal_source_tenant FOREIGN KEY (tenant_id, source_account_id) REFERENCES public.financial_accounts(tenant_id, id);
+
+
+--
+-- Name: payment_attempts fk_payment_attempt_payment_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.payment_attempts
-    ADD CONSTRAINT fk_payment_attempt_payment FOREIGN KEY (payment_id) REFERENCES public.payment_transactions(id) ON DELETE RESTRICT;
+    ADD CONSTRAINT fk_payment_attempt_payment_tenant FOREIGN KEY (tenant_id, payment_id) REFERENCES public.payment_transactions(tenant_id, id);
 
 
 --
--- Name: payment_transactions fk_payment_beneficiary; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: payment_attempts fk_payment_attempt_routing_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_attempts
+    ADD CONSTRAINT fk_payment_attempt_routing_tenant FOREIGN KEY (tenant_id, routing_decision_id) REFERENCES public.payment_provider_routing_decisions(tenant_id, id);
+
+
+--
+-- Name: payment_transactions fk_payment_beneficiary_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.payment_transactions
-    ADD CONSTRAINT fk_payment_beneficiary FOREIGN KEY (beneficiary_id) REFERENCES public.beneficiaries(id) ON DELETE RESTRICT;
+    ADD CONSTRAINT fk_payment_beneficiary_tenant FOREIGN KEY (tenant_id, beneficiary_id) REFERENCES public.beneficiaries(tenant_id, id) ON DELETE RESTRICT;
 
 
 --
@@ -2637,19 +4370,19 @@ ALTER TABLE ONLY public.payment_parties
 
 
 --
--- Name: payment_reversals fk_payment_reversal; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: payment_reversals fk_payment_reversal_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.payment_reversals
-    ADD CONSTRAINT fk_payment_reversal FOREIGN KEY (payment_id) REFERENCES public.payment_transactions(id) ON DELETE RESTRICT;
+    ADD CONSTRAINT fk_payment_reversal_tenant FOREIGN KEY (tenant_id, payment_id) REFERENCES public.payment_transactions(tenant_id, id) ON DELETE RESTRICT;
 
 
 --
--- Name: payment_transactions fk_payment_source_account; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: payment_transactions fk_payment_source_account_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.payment_transactions
-    ADD CONSTRAINT fk_payment_source_account FOREIGN KEY (source_account_id) REFERENCES public.financial_accounts(id) ON DELETE RESTRICT;
+    ADD CONSTRAINT fk_payment_source_account_tenant FOREIGN KEY (tenant_id, source_account_id) REFERENCES public.financial_accounts(tenant_id, id) ON DELETE RESTRICT;
 
 
 --
@@ -2725,35 +4458,35 @@ ALTER TABLE ONLY public.platform_revenue_shares
 
 
 --
--- Name: account_provider_accounts fk_provider_account; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: account_provider_accounts fk_provider_account_provider_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.account_provider_accounts
-    ADD CONSTRAINT fk_provider_account FOREIGN KEY (account_id) REFERENCES public.financial_accounts(id) ON DELETE RESTRICT;
+    ADD CONSTRAINT fk_provider_account_provider_tenant FOREIGN KEY (tenant_id, provider_id) REFERENCES public.account_providers(tenant_id, id) ON DELETE RESTRICT;
 
 
 --
--- Name: account_provider_accounts fk_provider_account_provider; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: account_provider_accounts fk_provider_account_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.account_provider_accounts
-    ADD CONSTRAINT fk_provider_account_provider FOREIGN KEY (provider_id) REFERENCES public.account_providers(id) ON DELETE RESTRICT;
+    ADD CONSTRAINT fk_provider_account_tenant FOREIGN KEY (tenant_id, account_id) REFERENCES public.financial_accounts(tenant_id, id) ON DELETE RESTRICT;
 
 
 --
--- Name: payment_provider_transactions fk_provider_payment; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: payment_provider_transactions fk_provider_payment_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.payment_provider_transactions
-    ADD CONSTRAINT fk_provider_payment FOREIGN KEY (payment_id) REFERENCES public.payment_transactions(id) ON DELETE RESTRICT;
+    ADD CONSTRAINT fk_provider_payment_tenant FOREIGN KEY (tenant_id, payment_id) REFERENCES public.payment_transactions(tenant_id, id) ON DELETE RESTRICT;
 
 
 --
--- Name: payment_reconciliation_records fk_reconciliation_payment; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: payment_reconciliation_records fk_reconciliation_payment_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.payment_reconciliation_records
-    ADD CONSTRAINT fk_reconciliation_payment FOREIGN KEY (payment_id) REFERENCES public.payment_transactions(id) ON DELETE RESTRICT;
+    ADD CONSTRAINT fk_reconciliation_payment_tenant FOREIGN KEY (tenant_id, payment_id) REFERENCES public.payment_transactions(tenant_id, id) ON DELETE RESTRICT;
 
 
 --
@@ -2762,6 +4495,70 @@ ALTER TABLE ONLY public.payment_reconciliation_records
 
 ALTER TABLE ONLY public.payment_reconciliation_records
     ADD CONSTRAINT fk_reconciliation_revenue_settlement FOREIGN KEY (platform_revenue_settlement_id) REFERENCES public.platform_revenue_settlements(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: payment_reconciliation_records fk_reconciliation_run_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_reconciliation_records
+    ADD CONSTRAINT fk_reconciliation_run_tenant FOREIGN KEY (tenant_id, run_id) REFERENCES public.payment_reconciliation_runs(tenant_id, id);
+
+
+--
+-- Name: virtual_account_provisioning_requests fk_va_account_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.virtual_account_provisioning_requests
+    ADD CONSTRAINT fk_va_account_tenant FOREIGN KEY (tenant_id, financial_account_id) REFERENCES public.financial_accounts(tenant_id, id);
+
+
+--
+-- Name: virtual_account_provisioning_requests fk_va_routing_tenant; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.virtual_account_provisioning_requests
+    ADD CONSTRAINT fk_va_routing_tenant FOREIGN KEY (tenant_id, routing_decision_id) REFERENCES public.payment_provider_routing_decisions(tenant_id, id);
+
+
+--
+-- Name: payment_collection_status_history payment_collection_status_history_tenant_id_collection_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_collection_status_history
+    ADD CONSTRAINT payment_collection_status_history_tenant_id_collection_id_fkey FOREIGN KEY (tenant_id, collection_id) REFERENCES public.payment_collections(tenant_id, id);
+
+
+--
+-- Name: payment_external_transfer_history payment_external_transfer_history_tenant_id_transfer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_external_transfer_history
+    ADD CONSTRAINT payment_external_transfer_history_tenant_id_transfer_id_fkey FOREIGN KEY (tenant_id, transfer_id) REFERENCES public.payment_external_transfers(tenant_id, id);
+
+
+--
+-- Name: payment_internal_transfer_history payment_internal_transfer_history_tenant_id_transfer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_internal_transfer_history
+    ADD CONSTRAINT payment_internal_transfer_history_tenant_id_transfer_id_fkey FOREIGN KEY (tenant_id, transfer_id) REFERENCES public.payment_internal_transfers(tenant_id, id);
+
+
+--
+-- Name: payment_reversal_history payment_reversal_history_tenant_id_reversal_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_reversal_history
+    ADD CONSTRAINT payment_reversal_history_tenant_id_reversal_id_fkey FOREIGN KEY (tenant_id, reversal_id) REFERENCES public.payment_reversals(tenant_id, id);
+
+
+--
+-- Name: payment_service_payout_attempts payment_service_payout_attempts_tenant_id_payout_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_service_payout_attempts
+    ADD CONSTRAINT payment_service_payout_attempts_tenant_id_payout_id_fkey FOREIGN KEY (tenant_id, payout_id) REFERENCES public.payment_service_payouts(tenant_id, id);
 
 
 --
@@ -2817,6 +4614,18 @@ CREATE POLICY beneficiaries_tenant_policy ON public.beneficiaries USING ((tenant
 
 
 --
+-- Name: bill_customer_validations; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.bill_customer_validations ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: bill_payment_quotes; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.bill_payment_quotes ENABLE ROW LEVEL SECURITY;
+
+--
 -- Name: bill_products; Type: ROW SECURITY; Schema: public; Owner: -
 --
 
@@ -2856,6 +4665,20 @@ CREATE POLICY bill_providers_tenant_policy ON public.bill_providers USING ((tena
 
 
 --
+-- Name: bill_payment_quotes bill_quote_tenant_policy; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY bill_quote_tenant_policy ON public.bill_payment_quotes USING ((tenant_id = public.current_tenant_id())) WITH CHECK ((tenant_id = public.current_tenant_id()));
+
+
+--
+-- Name: bill_transaction_status_history bill_status_history_tenant_policy; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY bill_status_history_tenant_policy ON public.bill_transaction_status_history USING ((tenant_id = public.current_tenant_id())) WITH CHECK ((tenant_id = public.current_tenant_id()));
+
+
+--
 -- Name: bill_transaction_attempts; Type: ROW SECURITY; Schema: public; Owner: -
 --
 
@@ -2869,6 +4692,12 @@ CREATE POLICY bill_transaction_attempts_tenant_policy ON public.bill_transaction
 
 
 --
+-- Name: bill_transaction_status_history; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.bill_transaction_status_history ENABLE ROW LEVEL SECURITY;
+
+--
 -- Name: bill_transactions; Type: ROW SECURITY; Schema: public; Owner: -
 --
 
@@ -2879,6 +4708,13 @@ ALTER TABLE public.bill_transactions ENABLE ROW LEVEL SECURITY;
 --
 
 CREATE POLICY bill_transactions_tenant_policy ON public.bill_transactions USING ((tenant_id = public.current_tenant_id())) WITH CHECK ((tenant_id = public.current_tenant_id()));
+
+
+--
+-- Name: bill_customer_validations bill_validation_tenant_policy; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY bill_validation_tenant_policy ON public.bill_customer_validations USING ((tenant_id = public.current_tenant_id())) WITH CHECK ((tenant_id = public.current_tenant_id()));
 
 
 --
@@ -2895,6 +4731,34 @@ CREATE POLICY bill_webhooks_tenant_policy ON public.bill_webhooks USING ((tenant
 
 
 --
+-- Name: payment_collection_status_history collection_history_tenant_policy; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY collection_history_tenant_policy ON public.payment_collection_status_history USING ((tenant_id = public.current_tenant_id())) WITH CHECK ((tenant_id = public.current_tenant_id()));
+
+
+--
+-- Name: payment_collections collections_tenant_policy; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY collections_tenant_policy ON public.payment_collections USING ((tenant_id = public.current_tenant_id())) WITH CHECK ((tenant_id = public.current_tenant_id()));
+
+
+--
+-- Name: payment_external_transfer_history external_transfer_history_tenant_policy; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY external_transfer_history_tenant_policy ON public.payment_external_transfer_history USING ((tenant_id = public.current_tenant_id())) WITH CHECK ((tenant_id = public.current_tenant_id()));
+
+
+--
+-- Name: payment_external_transfers external_transfer_tenant_policy; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY external_transfer_tenant_policy ON public.payment_external_transfers USING ((tenant_id = public.current_tenant_id())) WITH CHECK ((tenant_id = public.current_tenant_id()));
+
+
+--
 -- Name: financial_accounts; Type: ROW SECURITY; Schema: public; Owner: -
 --
 
@@ -2905,6 +4769,20 @@ ALTER TABLE public.financial_accounts ENABLE ROW LEVEL SECURITY;
 --
 
 CREATE POLICY financial_accounts_tenant_policy ON public.financial_accounts USING ((tenant_id = public.current_tenant_id())) WITH CHECK ((tenant_id = public.current_tenant_id()));
+
+
+--
+-- Name: payment_internal_transfer_history internal_transfer_history_tenant_policy; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY internal_transfer_history_tenant_policy ON public.payment_internal_transfer_history USING ((tenant_id = public.current_tenant_id())) WITH CHECK ((tenant_id = public.current_tenant_id()));
+
+
+--
+-- Name: payment_internal_transfers internal_transfer_tenant_policy; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY internal_transfer_tenant_policy ON public.payment_internal_transfers USING ((tenant_id = public.current_tenant_id())) WITH CHECK ((tenant_id = public.current_tenant_id()));
 
 
 --
@@ -2928,6 +4806,18 @@ CREATE POLICY payment_attempts_tenant_policy ON public.payment_attempts USING ((
 
 
 --
+-- Name: payment_collection_status_history; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.payment_collection_status_history ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: payment_collections; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.payment_collections ENABLE ROW LEVEL SECURITY;
+
+--
 -- Name: payment_disputes; Type: ROW SECURITY; Schema: public; Owner: -
 --
 
@@ -2939,6 +4829,18 @@ ALTER TABLE public.payment_disputes ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY payment_disputes_tenant_policy ON public.payment_disputes USING ((tenant_id = public.current_tenant_id())) WITH CHECK ((tenant_id = public.current_tenant_id()));
 
+
+--
+-- Name: payment_external_transfer_history; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.payment_external_transfer_history ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: payment_external_transfers; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.payment_external_transfers ENABLE ROW LEVEL SECURITY;
 
 --
 -- Name: payment_fees; Type: ROW SECURITY; Schema: public; Owner: -
@@ -2967,6 +4869,18 @@ CREATE POLICY payment_idempotency_tenant_policy ON public.payment_idempotency_ke
 
 
 --
+-- Name: payment_internal_transfer_history; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.payment_internal_transfer_history ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: payment_internal_transfers; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.payment_internal_transfers ENABLE ROW LEVEL SECURITY;
+
+--
 -- Name: payment_outbox_events; Type: ROW SECURITY; Schema: public; Owner: -
 --
 
@@ -2983,6 +4897,19 @@ ALTER TABLE public.payment_parties ENABLE ROW LEVEL SECURITY;
 --
 
 CREATE POLICY payment_parties_tenant_policy ON public.payment_parties USING ((tenant_id = public.current_tenant_id())) WITH CHECK ((tenant_id = public.current_tenant_id()));
+
+
+--
+-- Name: payment_provider_routing_decisions; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.payment_provider_routing_decisions ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: payment_provider_routing_decisions payment_provider_routing_tenant_policy; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY payment_provider_routing_tenant_policy ON public.payment_provider_routing_decisions USING ((tenant_id = public.current_tenant_id())) WITH CHECK ((tenant_id = public.current_tenant_id()));
 
 
 --
@@ -3005,6 +4932,18 @@ CREATE POLICY payment_provider_transactions_tenant_policy ON public.payment_prov
 ALTER TABLE public.payment_reconciliation_records ENABLE ROW LEVEL SECURITY;
 
 --
+-- Name: payment_reconciliation_runs; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.payment_reconciliation_runs ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: payment_reversal_history; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.payment_reversal_history ENABLE ROW LEVEL SECURITY;
+
+--
 -- Name: payment_reversals; Type: ROW SECURITY; Schema: public; Owner: -
 --
 
@@ -3016,6 +4955,18 @@ ALTER TABLE public.payment_reversals ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY payment_reversals_tenant_policy ON public.payment_reversals USING ((tenant_id = public.current_tenant_id())) WITH CHECK ((tenant_id = public.current_tenant_id()));
 
+
+--
+-- Name: payment_service_payout_attempts; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.payment_service_payout_attempts ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: payment_service_payouts; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.payment_service_payouts ENABLE ROW LEVEL SECURITY;
 
 --
 -- Name: payment_transactions; Type: ROW SECURITY; Schema: public; Owner: -
@@ -3109,11 +5060,52 @@ CREATE POLICY platform_revenue_shares_tenant_policy ON public.platform_revenue_s
 
 
 --
+-- Name: payment_reconciliation_runs reconciliation_run_tenant_policy; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY reconciliation_run_tenant_policy ON public.payment_reconciliation_runs USING ((tenant_id = public.current_tenant_id())) WITH CHECK ((tenant_id = public.current_tenant_id()));
+
+
+--
 -- Name: payment_reconciliation_records reconciliation_tenant_policy; Type: POLICY; Schema: public; Owner: -
 --
 
 CREATE POLICY reconciliation_tenant_policy ON public.payment_reconciliation_records USING ((tenant_id = public.current_tenant_id())) WITH CHECK ((tenant_id = public.current_tenant_id()));
 
+
+--
+-- Name: payment_reversal_history reversal_history_tenant_policy; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY reversal_history_tenant_policy ON public.payment_reversal_history USING ((tenant_id = public.current_tenant_id())) WITH CHECK ((tenant_id = public.current_tenant_id()));
+
+
+--
+-- Name: payment_service_payout_attempts service_payout_attempt_tenant_policy; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY service_payout_attempt_tenant_policy ON public.payment_service_payout_attempts USING ((tenant_id = public.current_tenant_id())) WITH CHECK ((tenant_id = public.current_tenant_id()));
+
+
+--
+-- Name: payment_service_payouts service_payout_tenant_policy; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY service_payout_tenant_policy ON public.payment_service_payouts USING ((tenant_id = public.current_tenant_id())) WITH CHECK ((tenant_id = public.current_tenant_id()));
+
+
+--
+-- Name: virtual_account_provisioning_requests va_provisioning_tenant_policy; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY va_provisioning_tenant_policy ON public.virtual_account_provisioning_requests USING ((tenant_id = public.current_tenant_id())) WITH CHECK ((tenant_id = public.current_tenant_id()));
+
+
+--
+-- Name: virtual_account_provisioning_requests; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.virtual_account_provisioning_requests ENABLE ROW LEVEL SECURITY;
 
 --
 -- PostgreSQL database dump complete
