@@ -234,6 +234,7 @@ export class BankOneProvider
   }
 }
 
+/** Produces BankOne's deterministic 12-character reference for an internal value. */
 function compactReference(value: string): string {
   return createHash("sha256")
     .update(value)
@@ -242,6 +243,7 @@ function compactReference(value: string): string {
     .toUpperCase();
 }
 
+/** Parses a provider response as JSON, returning an empty object for invalid JSON. */
 async function jsonBody(response: Response): Promise<Record<string, unknown>> {
   try {
     return (await response.json()) as Record<string, unknown>;
@@ -250,6 +252,7 @@ async function jsonBody(response: Response): Promise<Record<string, unknown>> {
   }
 }
 
+/** Returns the first non-empty string stored under the candidate response keys. */
 function stringValue(
   body: Record<string, unknown>,
   ...keys: string[]
@@ -259,6 +262,7 @@ function stringValue(
   return undefined;
 }
 
+/** Returns an object-valued response field when it is a non-array record. */
 function recordValue(
   body: Record<string, unknown>,
   key: string,
@@ -269,6 +273,7 @@ function recordValue(
     : undefined;
 }
 
+/** Maps a BankOne response into the provider-neutral submission outcome. */
 function mapOutcome(
   body: Record<string, unknown>,
   fallbackReference: string,

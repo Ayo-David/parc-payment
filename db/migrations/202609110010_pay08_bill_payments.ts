@@ -69,6 +69,7 @@ export async function up(knex: Knex): Promise<void> {
   `);
 }
 
+/** Rejects rollback because PAY-08 bill-payment controls are forward-only. */
 export function down(): Promise<never> {
   return Promise.reject(
     new Error("PAY-08 bill-payment controls are forward-only"),

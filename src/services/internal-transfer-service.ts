@@ -264,6 +264,7 @@ export class InternalTransferService {
   }
 }
 
+/** Maps a stored internal transfer to its public result shape. */
 function result(row: TransferRow, replayed: boolean) {
   return {
     id: row.id,

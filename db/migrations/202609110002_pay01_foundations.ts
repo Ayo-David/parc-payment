@@ -71,6 +71,7 @@ export async function up(knex: Knex): Promise<void> {
     GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO parc_payment_runtime,parc_payment_worker;
   `);
 }
+/** Rejects rollback because the PAY-01 foundations are forward-only. */
 export function down(): Promise<never> {
   return Promise.reject(new Error("PAY-01 foundations are forward-only"));
 }

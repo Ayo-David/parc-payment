@@ -510,6 +510,7 @@ export class ExternalTransferService {
   }
 }
 
+/** Validates the supported amount, currency, destination, and narration format. */
 function validate(input: {
   amountMinor: string;
   currency: string;

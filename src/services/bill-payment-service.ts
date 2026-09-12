@@ -514,10 +514,12 @@ export class BillPaymentService {
     );
   }
 }
+/** Requires a positive integer amount expressed in minor units. */
 function assertMoney(value: string): void {
   if (!/^[1-9]\d*$/.test(value))
     throw new Error("Amount must be a positive integer minor-unit string");
 }
+/** Validates a bill amount against the product's fixed or variable denomination. */
 function validateRange(
   product: {
     denomination_type: string;
@@ -539,9 +541,11 @@ function validateRange(
   )
     throw new Error("Amount outside product range");
 }
+/** Hashes a JSON-serializable value for idempotency and evidence comparison. */
 function hash(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
+/** Maps a stored bill quote to the public quote result. */
 function quoteResult(row: QuoteRow, replayed: boolean) {
   return {
     quoteId: row.id,

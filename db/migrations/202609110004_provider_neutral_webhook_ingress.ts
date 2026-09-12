@@ -24,6 +24,7 @@ export async function up(knex: Knex): Promise<void> {
     GRANT EXECUTE ON FUNCTION public.record_verified_payment_webhook(text,text,text,jsonb,text,text,text,text) TO parc_payment_runtime;
   `);
 }
+/** Rejects rollback because provider-neutral webhook ingress is forward-only. */
 export function down(): Promise<never> {
   return Promise.reject(
     new Error("Provider-neutral webhook ingress is forward-only"),

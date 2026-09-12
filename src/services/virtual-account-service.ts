@@ -222,6 +222,7 @@ export class VirtualAccountService {
   }
 }
 
+/** Hashes virtual-account request data for idempotency comparison. */
 function hash(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }

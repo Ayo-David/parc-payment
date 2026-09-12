@@ -36,6 +36,7 @@ const transfer = {
   narration: "Synthetic transfer",
 };
 
+/** Creates a BankOne adapter backed by the supplied HTTP test double. */
 function provider(http: typeof fetch): BankOneProvider {
   return new BankOneProvider(
     "synthetic-token",

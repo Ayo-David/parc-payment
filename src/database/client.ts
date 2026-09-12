@@ -6,6 +6,7 @@ export const createDatabase = (config: AppConfig): Knex =>
     connection: config.DATABASE_URL,
     pool: { min: 0, max: 10 },
   });
+/** Runs work in a transaction scoped to the supplied tenant for row-level security. */
 export function withTenantTransaction<T>(
   db: Knex,
   tenantId: string,

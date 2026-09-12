@@ -90,6 +90,7 @@ export class ProviderRoutingService {
     return { provider, decisionId: result.id, replayed: result.replayed };
   }
 }
+/** Hashes stable routing inputs for idempotency comparison. */
 function hash(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
