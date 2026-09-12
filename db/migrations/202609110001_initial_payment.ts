@@ -8,6 +8,7 @@ const approvedExistingBaselineHash =
 const canonicalSnapshotHash =
   "f2f0607400dd70500520fd515c26fbf351ccc74934940c0f458a19b1b308d93c";
 export const config = { transaction: false };
+/** Applies the verified payment schema baseline and grants service roles access. */
 export async function up(knex: Knex): Promise<void> {
   if (await knex.schema.hasTable("payment_transactions")) {
     if (
@@ -36,6 +37,7 @@ export async function up(knex: Knex): Promise<void> {
     GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO parc_payment_runtime,parc_payment_worker;
   `);
 }
+/** Rejects rollback because the payment schema baseline is forward-only. */
 export function down(): Promise<never> {
   return Promise.reject(new Error("Payment baseline is forward-only"));
 }

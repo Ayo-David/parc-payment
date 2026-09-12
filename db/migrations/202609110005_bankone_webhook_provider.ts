@@ -18,6 +18,7 @@ export async function up(knex: Knex): Promise<void> {
   `);
 }
 
+/** Rejects rollback because the BankOne webhook allowance is forward-only. */
 export function down(): Promise<never> {
   return Promise.reject(
     new Error("BankOne webhook provider allowance is forward-only"),

@@ -56,6 +56,7 @@ export async function up(knex: Knex): Promise<void> {
     CREATE TRIGGER trg_protect_submitted_payment_attempt BEFORE INSERT OR UPDATE ON public.payment_attempts FOR EACH ROW EXECUTE FUNCTION public.protect_submitted_payment_attempt();
   `);
 }
+/** Rejects rollback because the PAY-02 webhook safeguards are forward-only. */
 export function down(): Promise<never> {
   return Promise.reject(new Error("PAY-02 webhook safety is forward-only"));
 }

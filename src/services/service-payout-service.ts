@@ -168,6 +168,7 @@ export class ServicePayoutService {
     });
   }
 }
+/** Hashes payout evidence for immutable outbox events. */
 function hash(value: unknown) {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }

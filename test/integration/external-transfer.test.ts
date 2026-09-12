@@ -94,6 +94,7 @@ describeDatabase("PAY-06 external transfers", () => {
     providerData: { synthetic: true },
   });
 
+  /** Creates an external-transfer test service and exposes ledger call counters. */
   function service(provider: PaymentProvider) {
     const routing = {
       select: async () => ({

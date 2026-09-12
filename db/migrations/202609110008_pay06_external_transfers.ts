@@ -101,6 +101,7 @@ export async function up(knex: Knex): Promise<void> {
   `);
 }
 
+/** Rejects rollback because PAY-06 external-transfer controls are forward-only. */
 export function down(): Promise<never> {
   return Promise.reject(
     new Error("PAY-06 external-transfer controls are forward-only"),

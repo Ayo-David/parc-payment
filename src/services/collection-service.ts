@@ -207,6 +207,7 @@ export class CollectionService {
 export const collectionPayloadHash = (value: unknown): string =>
   createHash("sha256").update(JSON.stringify(value)).digest("hex");
 
+/** Returns a bounded, non-sensitive failure message for collection persistence. */
 function safeError(error: unknown): string {
   return error instanceof Error
     ? error.message.slice(0, 500)

@@ -2,6 +2,7 @@ import express, { type Express } from "express";
 import helmet from "helmet";
 import type { PaystackWebhookService } from "./services/paystack-webhook-service.js";
 
+/** Builds the payment HTTP application with webhook and health routes. */
 export function createApp(webhooks: PaystackWebhookService): Express {
   const app = express();
   app.disable("x-powered-by");

@@ -24,6 +24,7 @@ CREATE POLICY service_payout_attempt_tenant_policy ON public.payment_service_pay
 GRANT SELECT,INSERT,UPDATE ON public.payment_service_payouts,public.payment_service_payout_attempts TO parc_payment_runtime,parc_payment_worker;GRANT SELECT ON public.payment_service_payouts,public.payment_service_payout_attempts TO parc_payment_readonly;
 `);
 }
+/** Rejects rollback because LN-05 service payouts are forward-only. */
 export function down(): Promise<never> {
   return Promise.reject(new Error("LN-05 service payouts are forward-only"));
 }
