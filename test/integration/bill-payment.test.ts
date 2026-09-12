@@ -192,6 +192,15 @@ describeDatabase("PAY-08 bill payments", () => {
       status: "SUCCESSFUL",
       replayed: true,
     });
+    await expect(
+      service.pay({
+        ...command,
+        idempotencyKey: `pay-different-key-${tenantId}`,
+      }),
+    ).resolves.toMatchObject({
+      status: "SUCCESSFUL",
+      replayed: true,
+    });
     expect(calls).toEqual({ holds: 1, captures: 1, releases: 0 });
     expect(
       await db("payment_outbox_events")

@@ -24,6 +24,8 @@ type QuoteRow = {
 type BillRow = {
   id: string;
   status: string;
+  quote_id: string | null;
+  idempotency_key: string;
   request_hash: string;
   provider_reference: string | null;
   ledger_hold_id: string | null;
@@ -210,7 +212,7 @@ export class BillPaymentService {
       customerIdentifier: input.customerIdentifier,
       totalDebitMinor: quote.total_debit,
     });
-    const row = await withTenantTransaction(
+    const prepared = await withTenantTransaction(
       this.db,
       input.tenantId,
       async (tx) => {
@@ -225,8 +227,12 @@ export class BillPaymentService {
             throw new Error(
               "Idempotency key reused with a different bill payment",
             );
-          return existing;
+          return { row: existing, quoteAlreadyPaid: false };
         }
+        const quotePayment = await tx("bill_transactions")
+          .where({ tenant_id: input.tenantId, quote_id: quote.id })
+          .first<BillRow>();
+        if (quotePayment) return { row: quotePayment, quoteAlreadyPaid: true };
         const source = await tx("financial_accounts")
           .where({
             tenant_id: input.tenantId,
@@ -276,9 +282,19 @@ export class BillPaymentService {
           revenue_ledger_account_id: input.revenueLedgerAccountId,
           tax_ledger_account_id: input.taxLedgerAccountId,
         });
-        return (await tx("bill_transactions").where({ id }).first<BillRow>())!;
+        return {
+          row: (await tx("bill_transactions").where({ id }).first<BillRow>())!,
+          quoteAlreadyPaid: false,
+        };
       },
     );
+    if (prepared.quoteAlreadyPaid)
+      return {
+        billTransactionId: prepared.row.id,
+        status: prepared.row.status,
+        replayed: true,
+      };
+    const row = prepared.row;
     if (["SUCCESSFUL", "FAILED", "REVERSED", "REFUNDED"].includes(row.status))
       return { billTransactionId: row.id, status: row.status, replayed: true };
     const hold = row.ledger_hold_id

@@ -110,6 +110,38 @@ export class VirtualAccountService {
     );
     const current = await this.read(input.tenantId, prepared.request.id);
     if (current.status === "ACTIVE") return { ...current, replayed: true };
+    const submission = await withTenantTransaction(
+      this.db,
+      input.tenantId,
+      async (tx) => {
+        const claimed = await tx("virtual_account_provisioning_requests")
+          .where({
+            tenant_id: input.tenantId,
+            id: prepared.request.id,
+            status: "PENDING",
+          })
+          .update({ status: "SUBMITTED", submitted_at: tx.fn.now() });
+        if (claimed) return "SUBMITTED";
+        const request = await tx("virtual_account_provisioning_requests")
+          .where({ tenant_id: input.tenantId, id: prepared.request.id })
+          .first<{ status: string }>("status");
+        if (request?.status === "SUBMITTED") {
+          await tx("virtual_account_provisioning_requests")
+            .where({ tenant_id: input.tenantId, id: prepared.request.id })
+            .update({
+              status: "MANUAL_REVIEW",
+              failure_reason: "Submission already in progress",
+            });
+          return "MANUAL_REVIEW";
+        }
+        return request?.status ?? "MANUAL_REVIEW";
+      },
+    );
+    if (submission !== "SUBMITTED")
+      return {
+        ...(await this.read(input.tenantId, prepared.request.id)),
+        replayed: true,
+      };
     const result = await provider.createVirtualAccount(input.providerData);
     await withTenantTransaction(this.db, input.tenantId, async (tx) => {
       const providerRow = await tx("account_providers")

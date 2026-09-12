@@ -19,6 +19,12 @@ export async function up(knex: Knex): Promise<void> {
       ADD COLUMN next_inquiry_at timestamptz,
       ADD COLUMN inquiry_lease_expires_at timestamptz,
       ADD COLUMN last_inquiry_at timestamptz;
+    UPDATE public.payment_attempts
+      SET outcome_class = CASE
+        WHEN submission_state<>'NOT_SENT' OR provider_reference IS NOT NULL OR response_payload IS NOT NULL THEN 'AMBIGUOUS'
+        WHEN failure_code IS NOT NULL OR failure_reason IS NOT NULL THEN 'DEFINITE_PRE_SUBMISSION_FAILURE'
+        ELSE 'NOT_SENT'
+      END;
     ALTER TABLE public.payment_attempts ALTER COLUMN outcome_class DROP DEFAULT;
     ALTER TABLE public.payment_attempts ADD CONSTRAINT uq_payment_attempt_tenant_id UNIQUE(tenant_id,id);
 
