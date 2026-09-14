@@ -6,7 +6,7 @@ const snapshotUrl = new URL("../schema/current.sql", import.meta.url);
 const approvedExistingBaselineHash =
   "29ce49ba408d904bae0f8c1c15331d83c939fea789c54a908cbac65e0a8420c2";
 const canonicalSnapshotHash =
-  "f2f0607400dd70500520fd515c26fbf351ccc74934940c0f458a19b1b308d93c";
+  "dd7752e8f8a847429128e5109de7798659b54489eb789b4625eadb721ca73c8c";
 export const config = { transaction: false };
 /** Applies the verified payment schema baseline and grants service roles access. */
 export async function up(knex: Knex): Promise<void> {

@@ -92,7 +92,7 @@ export class HttpLedgerPostingGateway
       {
         method: "POST",
         headers: {
-          authorization: `Bearer ${this.serviceToken}`,
+          "x-internal-service-token": this.serviceToken,
           "content-type": "application/json",
           "x-tenant-id": input.tenantId,
           "x-calling-service": "parc-payment",
@@ -308,7 +308,7 @@ export class HttpLedgerPostingGateway
     return this.http(new URL(path, this.baseUrl), {
       method: "POST",
       headers: {
-        authorization: `Bearer ${this.serviceToken}`,
+        "x-internal-service-token": this.serviceToken,
         "content-type": "application/json",
         "x-tenant-id": identity.tenantId,
         "x-calling-service": "parc-payment",

@@ -171,6 +171,19 @@ CREATE TYPE public.payment_channel_enum AS ENUM (
 
 
 --
+-- Name: payment_inbox_status_enum; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.payment_inbox_status_enum AS ENUM (
+    'RECEIVED',
+    'PROCESSING',
+    'PROCESSED',
+    'FAILED',
+    'DEAD_LETTER'
+);
+
+
+--
 -- Name: payment_status_enum; Type: TYPE; Schema: public; Owner: -
 --
 
@@ -324,6 +337,16 @@ CREATE TYPE public.webhook_status_enum AS ENUM (
     'IGNORED',
     'DEAD_LETTERED'
 );
+
+
+--
+-- Name: claim_due_bill_inquiries(text, integer, integer); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.claim_due_bill_inquiries(p_worker_id text, p_limit integer, p_lease_seconds integer DEFAULT 60) RETURNS TABLE(attempt_id uuid, tenant_id uuid, bill_transaction_id uuid, provider_code character varying, provider_reference character varying, inquiry_attempts integer)
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'public', 'pg_temp'
+    AS $$ BEGIN IF nullif(btrim(p_worker_id),'') IS NULL OR p_limit<1 OR p_limit>100 OR p_lease_seconds<10 OR p_lease_seconds>600 THEN RAISE EXCEPTION 'Invalid bill inquiry claim'; END IF; RETURN QUERY WITH due AS (SELECT a.id FROM public.bill_transaction_attempts a WHERE a.outcome_class IN ('ACKNOWLEDGED_PENDING','AMBIGUOUS') AND a.next_inquiry_at<=now() AND (a.inquiry_lease_expires_at IS NULL OR a.inquiry_lease_expires_at<now()) ORDER BY a.next_inquiry_at,a.id FOR UPDATE SKIP LOCKED LIMIT p_limit), claimed AS (UPDATE public.bill_transaction_attempts a SET inquiry_lease_expires_at=now()+make_interval(secs=>p_lease_seconds),inquiry_attempts=a.inquiry_attempts+1 FROM due WHERE a.id=due.id RETURNING a.*) SELECT c.id,c.tenant_id,c.bill_transaction_id,bp.provider_code,COALESCE(c.provider_reference,'PARC-'||c.bill_transaction_id::text)::varchar,c.inquiry_attempts FROM claimed c JOIN public.bill_transactions b ON b.tenant_id=c.tenant_id AND b.id=c.bill_transaction_id JOIN public.bill_providers bp ON bp.tenant_id=b.tenant_id AND bp.id=b.provider_id; END $$;
 
 
 --
@@ -555,6 +578,22 @@ BEGIN
     RETURN NEW;
 END;
 $$;
+
+
+--
+-- Name: protect_published_bill_product_version(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_published_bill_product_version() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      IF TG_OP='DELETE' THEN RAISE EXCEPTION 'Published bill product versions are immutable'; END IF;
+      IF OLD.effective_to IS NULL AND NEW.effective_to IS NOT NULL AND
+         (to_jsonb(NEW)-'effective_to'-'updated_at')=(to_jsonb(OLD)-'effective_to'-'updated_at')
+      THEN RETURN NEW; END IF;
+      RAISE EXCEPTION 'Published bill product versions are immutable';
+    END $$;
 
 
 --
@@ -1008,6 +1047,94 @@ ALTER TABLE ONLY public.beneficiaries FORCE ROW LEVEL SECURITY;
 
 
 --
+-- Name: bill_catalogue_import_items; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.bill_catalogue_import_items (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    import_id uuid NOT NULL,
+    category_code character varying(100) NOT NULL,
+    category_name character varying(200) NOT NULL,
+    category character varying(30) NOT NULL,
+    biller_code character varying(100) NOT NULL,
+    biller_name character varying(200) NOT NULL,
+    product_code character varying(100) NOT NULL,
+    product_name character varying(200) NOT NULL,
+    description text,
+    denomination_type character varying(20) NOT NULL,
+    amount bigint,
+    min_amount bigint,
+    max_amount bigint,
+    currency character(3) NOT NULL,
+    source_payload jsonb NOT NULL,
+    evidence_hash character(64) NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT bill_catalogue_import_items_category_check CHECK (((category)::text = ANY (ARRAY[('AIRTIME'::character varying)::text, ('DATA'::character varying)::text, ('ELECTRICITY'::character varying)::text, ('CABLE_TV'::character varying)::text, ('INTERNET'::character varying)::text]))),
+    CONSTRAINT bill_catalogue_import_items_currency_check CHECK ((currency = 'NGN'::bpchar)),
+    CONSTRAINT bill_catalogue_import_items_denomination_type_check CHECK (((denomination_type)::text = ANY (ARRAY[('FIXED'::character varying)::text, ('VARIABLE'::character varying)::text]))),
+    CONSTRAINT chk_bill_catalogue_item_amounts CHECK (((((denomination_type)::text = 'FIXED'::text) AND (amount > 0) AND (min_amount IS NULL) AND (max_amount IS NULL)) OR (((denomination_type)::text = 'VARIABLE'::text) AND (amount IS NULL) AND (min_amount > 0) AND (max_amount >= min_amount))))
+);
+
+ALTER TABLE ONLY public.bill_catalogue_import_items FORCE ROW LEVEL SECURITY;
+
+
+--
+-- Name: bill_catalogue_imports; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.bill_catalogue_imports (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    provider_code character varying(50) NOT NULL,
+    status character varying(20) NOT NULL,
+    idempotency_key character varying(255) NOT NULL,
+    request_hash character(64) NOT NULL,
+    source_hash character(64),
+    category_count integer DEFAULT 0 NOT NULL,
+    product_count integer DEFAULT 0 NOT NULL,
+    failure_code character varying(100),
+    started_by uuid NOT NULL,
+    started_at timestamp with time zone DEFAULT now() NOT NULL,
+    completed_at timestamp with time zone,
+    raw_evidence_expires_at timestamp with time zone DEFAULT (now() + '30 days'::interval) NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT bill_catalogue_imports_category_count_check CHECK ((category_count >= 0)),
+    CONSTRAINT bill_catalogue_imports_product_count_check CHECK ((product_count >= 0)),
+    CONSTRAINT bill_catalogue_imports_provider_code_check CHECK (((provider_code)::text = 'MONNIFY'::text)),
+    CONSTRAINT bill_catalogue_imports_status_check CHECK (((status)::text = ANY (ARRAY[('IMPORTING'::character varying)::text, ('DRAFT'::character varying)::text, ('FAILED'::character varying)::text, ('PUBLISHED'::character varying)::text])))
+);
+
+ALTER TABLE ONLY public.bill_catalogue_imports FORCE ROW LEVEL SECURITY;
+
+
+--
+-- Name: bill_catalogue_publications; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.bill_catalogue_publications (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    import_id uuid NOT NULL,
+    provider_code character varying(50) NOT NULL,
+    catalogue_version integer NOT NULL,
+    approval_id uuid NOT NULL,
+    approval_payload_hash character(64) NOT NULL,
+    published_by uuid NOT NULL,
+    idempotency_key character varying(255) NOT NULL,
+    product_count integer NOT NULL,
+    published_at timestamp with time zone DEFAULT now() NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT bill_catalogue_publications_catalogue_version_check CHECK ((catalogue_version > 0)),
+    CONSTRAINT bill_catalogue_publications_product_count_check CHECK ((product_count > 0)),
+    CONSTRAINT bill_catalogue_publications_provider_code_check CHECK (((provider_code)::text = 'MONNIFY'::text))
+);
+
+ALTER TABLE ONLY public.bill_catalogue_publications FORCE ROW LEVEL SECURITY;
+
+
+--
 -- Name: bill_categories; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1114,7 +1241,7 @@ CREATE TABLE public.bill_products (
     cashback_amount bigint DEFAULT 0 NOT NULL,
     CONSTRAINT bill_products_cashback_amount_check CHECK ((cashback_amount >= 0)),
     CONSTRAINT bill_products_catalogue_version_check CHECK ((catalogue_version > 0)),
-    CONSTRAINT bill_products_denomination_type_check CHECK (((denomination_type)::text = ANY ((ARRAY['FIXED'::character varying, 'VARIABLE'::character varying])::text[]))),
+    CONSTRAINT bill_products_denomination_type_check CHECK (((denomination_type)::text = ANY (ARRAY[('FIXED'::character varying)::text, ('VARIABLE'::character varying)::text]))),
     CONSTRAINT bill_products_fee_amount_check CHECK ((fee_amount >= 0)),
     CONSTRAINT bill_products_tax_amount_check CHECK ((tax_amount >= 0)),
     CONSTRAINT chk_bill_product_amount CHECK (((amount IS NULL) OR ((amount)::numeric >= (0)::numeric))),
@@ -1164,10 +1291,21 @@ CREATE TABLE public.bill_providers (
     secret_reference character varying(500),
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    deleted_at timestamp with time zone
+    deleted_at timestamp with time zone,
+    provider_payable_ledger_account_id uuid,
+    revenue_ledger_account_id uuid,
+    tax_ledger_account_id uuid,
+    cashback_ledger_account_id uuid
 );
 
 ALTER TABLE ONLY public.bill_providers FORCE ROW LEVEL SECURITY;
+
+
+--
+-- Name: COLUMN bill_providers.provider_payable_ledger_account_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.bill_providers.provider_payable_ledger_account_id IS 'Opaque account identifier owned and validated by Ledger; never a cross-database foreign key.';
 
 
 --
@@ -1197,8 +1335,8 @@ CREATE TABLE public.bill_transaction_attempts (
     evidence_hash character(64),
     raw_evidence_expires_at timestamp with time zone DEFAULT (now() + '30 days'::interval) NOT NULL,
     CONSTRAINT bill_transaction_attempts_inquiry_attempts_check CHECK ((inquiry_attempts >= 0)),
-    CONSTRAINT bill_transaction_attempts_outcome_class_check CHECK (((outcome_class)::text = ANY ((ARRAY['NOT_SUBMITTED'::character varying, 'ACKNOWLEDGED_PENDING'::character varying, 'AMBIGUOUS'::character varying, 'FINAL_SUCCESS'::character varying, 'FINAL_FAILURE'::character varying, 'REVERSED'::character varying])::text[]))),
-    CONSTRAINT bill_transaction_attempts_submission_state_check CHECK (((submission_state)::text = ANY ((ARRAY['NOT_SENT'::character varying, 'SUBMITTED'::character varying, 'ACKNOWLEDGED'::character varying])::text[]))),
+    CONSTRAINT bill_transaction_attempts_outcome_class_check CHECK (((outcome_class)::text = ANY (ARRAY[('NOT_SUBMITTED'::character varying)::text, ('ACKNOWLEDGED_PENDING'::character varying)::text, ('AMBIGUOUS'::character varying)::text, ('FINAL_SUCCESS'::character varying)::text, ('FINAL_FAILURE'::character varying)::text, ('REVERSED'::character varying)::text]))),
+    CONSTRAINT bill_transaction_attempts_submission_state_check CHECK (((submission_state)::text = ANY (ARRAY[('NOT_SENT'::character varying)::text, ('SUBMITTED'::character varying)::text, ('ACKNOWLEDGED'::character varying)::text]))),
     CONSTRAINT chk_bill_attempt_number CHECK ((attempt_number > 0))
 );
 
@@ -1274,7 +1412,7 @@ CREATE TABLE public.bill_transactions (
     next_inquiry_at timestamp with time zone,
     financial_record_retain_until timestamp with time zone DEFAULT (now() + '7 years'::interval) NOT NULL,
     CONSTRAINT bill_transactions_cashback_amount_check CHECK ((cashback_amount >= 0)),
-    CONSTRAINT bill_transactions_outcome_class_check CHECK (((outcome_class)::text = ANY ((ARRAY['NOT_SUBMITTED'::character varying, 'ACKNOWLEDGED_PENDING'::character varying, 'AMBIGUOUS'::character varying, 'FINAL_SUCCESS'::character varying, 'FINAL_FAILURE'::character varying, 'REVERSED'::character varying])::text[]))),
+    CONSTRAINT bill_transactions_outcome_class_check CHECK (((outcome_class)::text = ANY (ARRAY[('NOT_SUBMITTED'::character varying)::text, ('ACKNOWLEDGED_PENDING'::character varying)::text, ('AMBIGUOUS'::character varying)::text, ('FINAL_SUCCESS'::character varying)::text, ('FINAL_FAILURE'::character varying)::text, ('REVERSED'::character varying)::text]))),
     CONSTRAINT bill_transactions_tax_amount_check CHECK ((tax_amount >= 0)),
     CONSTRAINT chk_bill_total CHECK ((total_debit = ((amount + fee_amount) + tax_amount))),
     CONSTRAINT chk_bill_transaction_amount CHECK (((amount)::numeric > (0)::numeric)),
@@ -1557,6 +1695,38 @@ CREATE TABLE public.payment_idempotency_keys (
 );
 
 ALTER TABLE ONLY public.payment_idempotency_keys FORCE ROW LEVEL SECURITY;
+
+
+--
+-- Name: payment_inbox_events; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.payment_inbox_events (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    event_id uuid NOT NULL,
+    source_service character varying(100) NOT NULL,
+    event_type character varying(150) NOT NULL,
+    event_version integer NOT NULL,
+    aggregate_type character varying(100),
+    aggregate_id uuid,
+    correlation_id uuid,
+    causation_id uuid,
+    payload jsonb NOT NULL,
+    headers jsonb DEFAULT '{}'::jsonb NOT NULL,
+    status public.payment_inbox_status_enum DEFAULT 'RECEIVED'::public.payment_inbox_status_enum NOT NULL,
+    attempt_count integer DEFAULT 0 NOT NULL,
+    received_at timestamp with time zone DEFAULT now() NOT NULL,
+    processing_started_at timestamp with time zone,
+    processed_at timestamp with time zone,
+    next_attempt_at timestamp with time zone,
+    last_error_code character varying(100),
+    last_error_message text,
+    CONSTRAINT payment_inbox_events_attempt_count_check CHECK ((attempt_count >= 0)),
+    CONSTRAINT payment_inbox_events_event_version_check CHECK ((event_version > 0))
+);
+
+ALTER TABLE ONLY public.payment_inbox_events FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -1856,7 +2026,7 @@ CREATE TABLE public.payment_service_payout_attempts (
     retention_until date DEFAULT (CURRENT_DATE + 2557) NOT NULL,
     legal_hold boolean DEFAULT false NOT NULL,
     CONSTRAINT payment_service_payout_attempts_attempt_number_check CHECK ((attempt_number > 0)),
-    CONSTRAINT payment_service_payout_attempts_outcome_certainty_check CHECK (((outcome_certainty)::text = ANY ((ARRAY['CERTAIN'::character varying, 'AMBIGUOUS'::character varying])::text[])))
+    CONSTRAINT payment_service_payout_attempts_outcome_certainty_check CHECK (((outcome_certainty)::text = ANY (ARRAY[('CERTAIN'::character varying)::text, ('AMBIGUOUS'::character varying)::text])))
 );
 
 ALTER TABLE ONLY public.payment_service_payout_attempts FORCE ROW LEVEL SECURITY;
@@ -1893,7 +2063,7 @@ CREATE TABLE public.payment_service_payouts (
     legal_hold boolean DEFAULT false NOT NULL,
     CONSTRAINT payment_service_payouts_amount_check CHECK ((amount > 0)),
     CONSTRAINT payment_service_payouts_currency_check CHECK ((currency = 'NGN'::bpchar)),
-    CONSTRAINT payment_service_payouts_status_check CHECK (((status)::text = ANY ((ARRAY['CREATED'::character varying, 'SUBMITTING'::character varying, 'PENDING'::character varying, 'SUCCEEDED'::character varying, 'FAILED'::character varying, 'REVERSED'::character varying, 'MANUAL_REVIEW'::character varying])::text[])))
+    CONSTRAINT payment_service_payouts_status_check CHECK (((status)::text = ANY (ARRAY[('CREATED'::character varying)::text, ('SUBMITTING'::character varying)::text, ('PENDING'::character varying)::text, ('SUCCEEDED'::character varying)::text, ('FAILED'::character varying)::text, ('REVERSED'::character varying)::text, ('MANUAL_REVIEW'::character varying)::text])))
 );
 
 ALTER TABLE ONLY public.payment_service_payouts FORCE ROW LEVEL SECURITY;
@@ -2281,6 +2451,94 @@ ALTER TABLE ONLY public.beneficiaries
 
 
 --
+-- Name: bill_catalogue_import_items bill_catalogue_import_items_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_catalogue_import_items
+    ADD CONSTRAINT bill_catalogue_import_items_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: bill_catalogue_import_items bill_catalogue_import_items_tenant_id_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_catalogue_import_items
+    ADD CONSTRAINT bill_catalogue_import_items_tenant_id_id_key UNIQUE (tenant_id, id);
+
+
+--
+-- Name: bill_catalogue_import_items bill_catalogue_import_items_tenant_id_import_id_product_cod_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_catalogue_import_items
+    ADD CONSTRAINT bill_catalogue_import_items_tenant_id_import_id_product_cod_key UNIQUE (tenant_id, import_id, product_code);
+
+
+--
+-- Name: bill_catalogue_imports bill_catalogue_imports_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_catalogue_imports
+    ADD CONSTRAINT bill_catalogue_imports_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: bill_catalogue_imports bill_catalogue_imports_tenant_id_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_catalogue_imports
+    ADD CONSTRAINT bill_catalogue_imports_tenant_id_id_key UNIQUE (tenant_id, id);
+
+
+--
+-- Name: bill_catalogue_imports bill_catalogue_imports_tenant_id_idempotency_key_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_catalogue_imports
+    ADD CONSTRAINT bill_catalogue_imports_tenant_id_idempotency_key_key UNIQUE (tenant_id, idempotency_key);
+
+
+--
+-- Name: bill_catalogue_publications bill_catalogue_publications_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_catalogue_publications
+    ADD CONSTRAINT bill_catalogue_publications_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: bill_catalogue_publications bill_catalogue_publications_tenant_id_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_catalogue_publications
+    ADD CONSTRAINT bill_catalogue_publications_tenant_id_id_key UNIQUE (tenant_id, id);
+
+
+--
+-- Name: bill_catalogue_publications bill_catalogue_publications_tenant_id_idempotency_key_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_catalogue_publications
+    ADD CONSTRAINT bill_catalogue_publications_tenant_id_idempotency_key_key UNIQUE (tenant_id, idempotency_key);
+
+
+--
+-- Name: bill_catalogue_publications bill_catalogue_publications_tenant_id_import_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_catalogue_publications
+    ADD CONSTRAINT bill_catalogue_publications_tenant_id_import_id_key UNIQUE (tenant_id, import_id);
+
+
+--
+-- Name: bill_catalogue_publications bill_catalogue_publications_tenant_id_provider_code_catalog_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_catalogue_publications
+    ADD CONSTRAINT bill_catalogue_publications_tenant_id_provider_code_catalog_key UNIQUE (tenant_id, provider_code, catalogue_version);
+
+
+--
 -- Name: bill_categories bill_categories_code_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -2470,6 +2728,30 @@ ALTER TABLE ONLY public.payment_fees
 
 ALTER TABLE ONLY public.payment_idempotency_keys
     ADD CONSTRAINT payment_idempotency_keys_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: payment_inbox_events payment_inbox_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_inbox_events
+    ADD CONSTRAINT payment_inbox_events_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: payment_inbox_events payment_inbox_events_source_service_event_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_inbox_events
+    ADD CONSTRAINT payment_inbox_events_source_service_event_id_key UNIQUE (source_service, event_id);
+
+
+--
+-- Name: payment_inbox_events payment_inbox_events_tenant_id_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_inbox_events
+    ADD CONSTRAINT payment_inbox_events_tenant_id_id_key UNIQUE (tenant_id, id);
 
 
 --
@@ -3201,10 +3483,24 @@ CREATE INDEX idx_bill_attempts_transaction ON public.bill_transaction_attempts U
 
 
 --
+-- Name: idx_bill_catalogue_import_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_bill_catalogue_import_status ON public.bill_catalogue_imports USING btree (tenant_id, status, created_at DESC);
+
+
+--
+-- Name: idx_bill_catalogue_items_import; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_bill_catalogue_items_import ON public.bill_catalogue_import_items USING btree (tenant_id, import_id);
+
+
+--
 -- Name: idx_bill_inquiry_due; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_bill_inquiry_due ON public.bill_transaction_attempts USING btree (next_inquiry_at, inquiry_lease_expires_at) WHERE ((outcome_class)::text = ANY ((ARRAY['ACKNOWLEDGED_PENDING'::character varying, 'AMBIGUOUS'::character varying])::text[]));
+CREATE INDEX idx_bill_inquiry_due ON public.bill_transaction_attempts USING btree (next_inquiry_at, inquiry_lease_expires_at) WHERE ((outcome_class)::text = ANY (ARRAY[('ACKNOWLEDGED_PENDING'::character varying)::text, ('AMBIGUOUS'::character varying)::text]));
 
 
 --
@@ -3401,6 +3697,20 @@ CREATE INDEX idx_payment_idempotency_expiry ON public.payment_idempotency_keys U
 --
 
 CREATE INDEX idx_payment_idempotency_resource ON public.payment_idempotency_keys USING btree (tenant_id, resource_type, resource_id);
+
+
+--
+-- Name: idx_payment_inbox_pending; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_payment_inbox_pending ON public.payment_inbox_events USING btree (status, next_attempt_at, received_at) WHERE (status = ANY (ARRAY['RECEIVED'::public.payment_inbox_status_enum, 'FAILED'::public.payment_inbox_status_enum]));
+
+
+--
+-- Name: idx_payment_inbox_tenant_received; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_payment_inbox_tenant_received ON public.payment_inbox_events USING btree (tenant_id, received_at DESC);
 
 
 --
@@ -3694,7 +4004,7 @@ CREATE INDEX idx_reconciliation_run_claim ON public.payment_reconciliation_runs 
 -- Name: idx_service_payout_inquiry; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_service_payout_inquiry ON public.payment_service_payouts USING btree (status, next_inquiry_at) WHERE ((status)::text = ANY ((ARRAY['PENDING'::character varying, 'MANUAL_REVIEW'::character varying])::text[]));
+CREATE INDEX idx_service_payout_inquiry ON public.payment_service_payouts USING btree (status, next_inquiry_at) WHERE ((status)::text = ANY (ARRAY[('PENDING'::character varying)::text, ('MANUAL_REVIEW'::character varying)::text]));
 
 
 --
@@ -3836,8 +4146,6 @@ CREATE TRIGGER trg_financial_accounts_updated_at BEFORE UPDATE ON public.financi
 
 CREATE TRIGGER trg_immutable_payment_routing_decision BEFORE DELETE OR UPDATE ON public.payment_provider_routing_decisions FOR EACH ROW EXECUTE FUNCTION public.prevent_payment_routing_decision_change();
 
-ALTER TABLE public.payment_provider_routing_decisions DISABLE TRIGGER trg_immutable_payment_routing_decision;
-
 
 --
 -- Name: payment_internal_transfers trg_internal_transfer_status; Type: TRIGGER; Schema: public; Owner: -
@@ -3900,6 +4208,20 @@ CREATE TRIGGER trg_prevent_platform_revenue_settlement_item_delete BEFORE DELETE
 --
 
 CREATE TRIGGER trg_prevent_unsafe_provider_change BEFORE INSERT ON public.payment_attempts FOR EACH ROW EXECUTE FUNCTION public.prevent_unsafe_provider_change();
+
+
+--
+-- Name: bill_catalogue_import_items trg_protect_bill_catalogue_item; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_protect_bill_catalogue_item BEFORE DELETE OR UPDATE ON public.bill_catalogue_import_items FOR EACH ROW EXECUTE FUNCTION public.protect_bill_immutable();
+
+
+--
+-- Name: bill_catalogue_publications trg_protect_bill_catalogue_publication; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_protect_bill_catalogue_publication BEFORE DELETE OR UPDATE ON public.bill_catalogue_publications FOR EACH ROW EXECUTE FUNCTION public.protect_bill_immutable();
 
 
 --
@@ -3976,7 +4298,7 @@ CREATE TRIGGER trg_protect_platform_revenue_share_economics BEFORE UPDATE ON pub
 -- Name: bill_products trg_protect_published_bill_product; Type: TRIGGER; Schema: public; Owner: -
 --
 
-CREATE TRIGGER trg_protect_published_bill_product BEFORE DELETE OR UPDATE ON public.bill_products FOR EACH ROW WHEN ((old.published_at IS NOT NULL)) EXECUTE FUNCTION public.protect_bill_immutable();
+CREATE TRIGGER trg_protect_published_bill_product BEFORE DELETE OR UPDATE ON public.bill_products FOR EACH ROW WHEN ((old.published_at IS NOT NULL)) EXECUTE FUNCTION public.protect_published_bill_product_version();
 
 
 --
@@ -4127,6 +4449,22 @@ ALTER TABLE ONLY public.payment_attempts
 
 ALTER TABLE ONLY public.bill_transaction_attempts
     ADD CONSTRAINT fk_bill_attempt_transaction_tenant FOREIGN KEY (tenant_id, bill_transaction_id) REFERENCES public.bill_transactions(tenant_id, id);
+
+
+--
+-- Name: bill_catalogue_import_items fk_bill_catalogue_item_import; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_catalogue_import_items
+    ADD CONSTRAINT fk_bill_catalogue_item_import FOREIGN KEY (tenant_id, import_id) REFERENCES public.bill_catalogue_imports(tenant_id, id);
+
+
+--
+-- Name: bill_catalogue_publications fk_bill_catalogue_publication_import; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bill_catalogue_publications
+    ADD CONSTRAINT fk_bill_catalogue_publication_import FOREIGN KEY (tenant_id, import_id) REFERENCES public.bill_catalogue_imports(tenant_id, id);
 
 
 --
@@ -4614,6 +4952,45 @@ CREATE POLICY beneficiaries_tenant_policy ON public.beneficiaries USING ((tenant
 
 
 --
+-- Name: bill_catalogue_import_items; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.bill_catalogue_import_items ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: bill_catalogue_imports bill_catalogue_import_tenant_policy; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY bill_catalogue_import_tenant_policy ON public.bill_catalogue_imports USING ((tenant_id = public.current_tenant_id())) WITH CHECK ((tenant_id = public.current_tenant_id()));
+
+
+--
+-- Name: bill_catalogue_imports; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.bill_catalogue_imports ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: bill_catalogue_import_items bill_catalogue_item_tenant_policy; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY bill_catalogue_item_tenant_policy ON public.bill_catalogue_import_items USING ((tenant_id = public.current_tenant_id())) WITH CHECK ((tenant_id = public.current_tenant_id()));
+
+
+--
+-- Name: bill_catalogue_publications bill_catalogue_publication_tenant_policy; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY bill_catalogue_publication_tenant_policy ON public.bill_catalogue_publications USING ((tenant_id = public.current_tenant_id())) WITH CHECK ((tenant_id = public.current_tenant_id()));
+
+
+--
+-- Name: bill_catalogue_publications; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.bill_catalogue_publications ENABLE ROW LEVEL SECURITY;
+
+--
 -- Name: bill_customer_validations; Type: ROW SECURITY; Schema: public; Owner: -
 --
 
@@ -4869,6 +5246,19 @@ CREATE POLICY payment_idempotency_tenant_policy ON public.payment_idempotency_ke
 
 
 --
+-- Name: payment_inbox_events; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.payment_inbox_events ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: payment_inbox_events payment_inbox_tenant_policy; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY payment_inbox_tenant_policy ON public.payment_inbox_events USING ((tenant_id = public.current_tenant_id())) WITH CHECK ((tenant_id = public.current_tenant_id()));
+
+
+--
 -- Name: payment_internal_transfer_history; Type: ROW SECURITY; Schema: public; Owner: -
 --
 
@@ -5106,6 +5496,445 @@ CREATE POLICY va_provisioning_tenant_policy ON public.virtual_account_provisioni
 --
 
 ALTER TABLE public.virtual_account_provisioning_requests ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: SCHEMA public; Type: ACL; Schema: -; Owner: -
+--
+
+GRANT USAGE ON SCHEMA public TO parc_payment_runtime;
+GRANT USAGE ON SCHEMA public TO parc_payment_worker;
+GRANT USAGE ON SCHEMA public TO parc_payment_readonly;
+
+
+--
+-- Name: FUNCTION claim_due_bill_inquiries(p_worker_id text, p_limit integer, p_lease_seconds integer); Type: ACL; Schema: public; Owner: -
+--
+
+REVOKE ALL ON FUNCTION public.claim_due_bill_inquiries(p_worker_id text, p_limit integer, p_lease_seconds integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION public.claim_due_bill_inquiries(p_worker_id text, p_limit integer, p_lease_seconds integer) TO parc_payment_worker;
+
+
+--
+-- Name: TABLE account_provider_accounts; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.account_provider_accounts TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.account_provider_accounts TO parc_payment_worker;
+GRANT SELECT ON TABLE public.account_provider_accounts TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE account_providers; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.account_providers TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.account_providers TO parc_payment_worker;
+GRANT SELECT ON TABLE public.account_providers TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE account_status_history; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.account_status_history TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.account_status_history TO parc_payment_worker;
+GRANT SELECT ON TABLE public.account_status_history TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE beneficiaries; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.beneficiaries TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.beneficiaries TO parc_payment_worker;
+GRANT SELECT ON TABLE public.beneficiaries TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE bill_catalogue_import_items; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.bill_catalogue_import_items TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.bill_catalogue_import_items TO parc_payment_worker;
+GRANT SELECT ON TABLE public.bill_catalogue_import_items TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE bill_catalogue_imports; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.bill_catalogue_imports TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.bill_catalogue_imports TO parc_payment_worker;
+GRANT SELECT ON TABLE public.bill_catalogue_imports TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE bill_catalogue_publications; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.bill_catalogue_publications TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.bill_catalogue_publications TO parc_payment_worker;
+GRANT SELECT ON TABLE public.bill_catalogue_publications TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE bill_categories; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.bill_categories TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.bill_categories TO parc_payment_worker;
+GRANT SELECT ON TABLE public.bill_categories TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE bill_customer_validations; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.bill_customer_validations TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.bill_customer_validations TO parc_payment_worker;
+GRANT SELECT ON TABLE public.bill_customer_validations TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE bill_payment_quotes; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.bill_payment_quotes TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.bill_payment_quotes TO parc_payment_worker;
+GRANT SELECT ON TABLE public.bill_payment_quotes TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE bill_products; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.bill_products TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.bill_products TO parc_payment_worker;
+GRANT SELECT ON TABLE public.bill_products TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE bill_provider_transactions; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.bill_provider_transactions TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.bill_provider_transactions TO parc_payment_worker;
+GRANT SELECT ON TABLE public.bill_provider_transactions TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE bill_providers; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.bill_providers TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.bill_providers TO parc_payment_worker;
+GRANT SELECT ON TABLE public.bill_providers TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE bill_transaction_attempts; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.bill_transaction_attempts TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.bill_transaction_attempts TO parc_payment_worker;
+GRANT SELECT ON TABLE public.bill_transaction_attempts TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE bill_transaction_status_history; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.bill_transaction_status_history TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.bill_transaction_status_history TO parc_payment_worker;
+GRANT SELECT ON TABLE public.bill_transaction_status_history TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE bill_transactions; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.bill_transactions TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.bill_transactions TO parc_payment_worker;
+GRANT SELECT ON TABLE public.bill_transactions TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE bill_webhooks; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.bill_webhooks TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.bill_webhooks TO parc_payment_worker;
+GRANT SELECT ON TABLE public.bill_webhooks TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE financial_accounts; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.financial_accounts TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.financial_accounts TO parc_payment_worker;
+GRANT SELECT ON TABLE public.financial_accounts TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE payment_attempts; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_attempts TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_attempts TO parc_payment_worker;
+GRANT SELECT ON TABLE public.payment_attempts TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE payment_collection_status_history; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_collection_status_history TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_collection_status_history TO parc_payment_worker;
+GRANT SELECT ON TABLE public.payment_collection_status_history TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE payment_collections; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_collections TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_collections TO parc_payment_worker;
+GRANT SELECT ON TABLE public.payment_collections TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE payment_disputes; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_disputes TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_disputes TO parc_payment_worker;
+GRANT SELECT ON TABLE public.payment_disputes TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE payment_external_transfer_history; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_external_transfer_history TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_external_transfer_history TO parc_payment_worker;
+GRANT SELECT ON TABLE public.payment_external_transfer_history TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE payment_external_transfers; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_external_transfers TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_external_transfers TO parc_payment_worker;
+GRANT SELECT ON TABLE public.payment_external_transfers TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE payment_fees; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_fees TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_fees TO parc_payment_worker;
+GRANT SELECT ON TABLE public.payment_fees TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE payment_idempotency_keys; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_idempotency_keys TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_idempotency_keys TO parc_payment_worker;
+GRANT SELECT ON TABLE public.payment_idempotency_keys TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE payment_inbox_events; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_inbox_events TO parc_payment_worker;
+GRANT SELECT ON TABLE public.payment_inbox_events TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE payment_internal_transfer_history; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_internal_transfer_history TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_internal_transfer_history TO parc_payment_worker;
+GRANT SELECT ON TABLE public.payment_internal_transfer_history TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE payment_internal_transfers; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_internal_transfers TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_internal_transfers TO parc_payment_worker;
+GRANT SELECT ON TABLE public.payment_internal_transfers TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE payment_outbox_events; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_outbox_events TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_outbox_events TO parc_payment_worker;
+GRANT SELECT ON TABLE public.payment_outbox_events TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE payment_parties; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_parties TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_parties TO parc_payment_worker;
+GRANT SELECT ON TABLE public.payment_parties TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE payment_provider_routing_decisions; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_provider_routing_decisions TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_provider_routing_decisions TO parc_payment_worker;
+GRANT SELECT ON TABLE public.payment_provider_routing_decisions TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE payment_provider_transactions; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_provider_transactions TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_provider_transactions TO parc_payment_worker;
+GRANT SELECT ON TABLE public.payment_provider_transactions TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE payment_reconciliation_records; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_reconciliation_records TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_reconciliation_records TO parc_payment_worker;
+GRANT SELECT ON TABLE public.payment_reconciliation_records TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE payment_reconciliation_runs; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_reconciliation_runs TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_reconciliation_runs TO parc_payment_worker;
+GRANT SELECT ON TABLE public.payment_reconciliation_runs TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE payment_reversal_history; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_reversal_history TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_reversal_history TO parc_payment_worker;
+GRANT SELECT ON TABLE public.payment_reversal_history TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE payment_reversals; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_reversals TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_reversals TO parc_payment_worker;
+GRANT SELECT ON TABLE public.payment_reversals TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE payment_service_payout_attempts; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_service_payout_attempts TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_service_payout_attempts TO parc_payment_worker;
+GRANT SELECT ON TABLE public.payment_service_payout_attempts TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE payment_service_payouts; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_service_payouts TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_service_payouts TO parc_payment_worker;
+GRANT SELECT ON TABLE public.payment_service_payouts TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE payment_transactions; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_transactions TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_transactions TO parc_payment_worker;
+GRANT SELECT ON TABLE public.payment_transactions TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE payment_webhooks; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_webhooks TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.payment_webhooks TO parc_payment_worker;
+GRANT SELECT ON TABLE public.payment_webhooks TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE platform_revenue_adjustments; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.platform_revenue_adjustments TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.platform_revenue_adjustments TO parc_payment_worker;
+GRANT SELECT ON TABLE public.platform_revenue_adjustments TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE platform_revenue_events; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.platform_revenue_events TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.platform_revenue_events TO parc_payment_worker;
+GRANT SELECT ON TABLE public.platform_revenue_events TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE platform_revenue_settlement_items; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.platform_revenue_settlement_items TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.platform_revenue_settlement_items TO parc_payment_worker;
+GRANT SELECT ON TABLE public.platform_revenue_settlement_items TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE platform_revenue_settlements; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.platform_revenue_settlements TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.platform_revenue_settlements TO parc_payment_worker;
+GRANT SELECT ON TABLE public.platform_revenue_settlements TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE platform_revenue_shares; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.platform_revenue_shares TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.platform_revenue_shares TO parc_payment_worker;
+GRANT SELECT ON TABLE public.platform_revenue_shares TO parc_payment_readonly;
+
+
+--
+-- Name: TABLE virtual_account_provisioning_requests; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT SELECT,INSERT,UPDATE ON TABLE public.virtual_account_provisioning_requests TO parc_payment_runtime;
+GRANT SELECT,INSERT,UPDATE ON TABLE public.virtual_account_provisioning_requests TO parc_payment_worker;
+GRANT SELECT ON TABLE public.virtual_account_provisioning_requests TO parc_payment_readonly;
+
 
 --
 -- PostgreSQL database dump complete

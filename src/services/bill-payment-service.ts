@@ -30,6 +30,9 @@ type BillRow = {
   provider_reference: string | null;
   ledger_hold_id: string | null;
   ledger_transaction_id: string | null;
+  provider_payable_ledger_account_id: string | null;
+  revenue_ledger_account_id: string | null;
+  tax_ledger_account_id: string | null;
 };
 
 export class BillPaymentService {
@@ -40,6 +43,92 @@ export class BillPaymentService {
     private readonly ledger: BillLedgerGateway,
   ) {}
 
+  async validateCustomer(input: {
+    tenantId: string;
+    customerId: string;
+    productId: string;
+    customerIdentifier: string;
+    idempotencyKey: string;
+    correlationId: string;
+  }): Promise<{
+    validation_id: string;
+    customer_name?: string;
+    expires_at: string;
+    replayed: boolean;
+  }> {
+    const requestHash = hash({
+      customerId: input.customerId,
+      productId: input.productId,
+      customerIdentifier: input.customerIdentifier,
+    });
+    const existing = await withTenantTransaction(
+      this.db,
+      input.tenantId,
+      (tx) =>
+        tx("bill_customer_validations")
+          .where({
+            tenant_id: input.tenantId,
+            idempotency_key: input.idempotencyKey,
+          })
+          .first<{
+            id: string;
+            request_hash: string;
+            normalized_customer_name: string | null;
+            expires_at: Date;
+          }>(),
+    );
+    if (existing) {
+      if (existing.request_hash !== requestHash)
+        throw new Error("Idempotency key reused with a different validation");
+      return validationResult(existing, true);
+    }
+    const routed = await this.routing.select({
+      tenantId: input.tenantId,
+      capability: "BILL_PAYMENT",
+      currency: "NGN",
+      correlationId: input.correlationId,
+      idempotencyKey: `bill-validation:${input.idempotencyKey}:route`,
+    });
+    const product = await this.availableProduct(
+      input.tenantId,
+      input.productId,
+    );
+    if (!product || product.provider_code !== routed.provider.code)
+      throw new Error("Bill product is unavailable for the selected provider");
+    const provider = this.providers.require(routed.provider.code);
+    const validation = await provider.validateCustomer({
+      productCode: product.product_code,
+      customerIdentifier: input.customerIdentifier,
+    });
+    const id = randomUUID();
+    const expiresAt = new Date(Date.now() + 5 * 60_000);
+    await withTenantTransaction(this.db, input.tenantId, (tx) =>
+      tx("bill_customer_validations").insert({
+        id,
+        tenant_id: input.tenantId,
+        customer_id: input.customerId,
+        product_id: input.productId,
+        customer_identifier: input.customerIdentifier,
+        normalized_customer_name: validation.customerName,
+        provider_code: provider.code,
+        provider_reference: validation.providerReference,
+        routing_decision_id: routed.decisionId,
+        idempotency_key: input.idempotencyKey,
+        request_hash: requestHash,
+        evidence_hash: hash(validation.evidence),
+        expires_at: expiresAt,
+      }),
+    );
+    return {
+      validation_id: id,
+      ...(validation.customerName
+        ? { customer_name: validation.customerName }
+        : {}),
+      expires_at: expiresAt.toISOString(),
+      replayed: false,
+    };
+  }
+
   async createQuote(input: {
     tenantId: string;
     customerId: string;
@@ -49,9 +138,9 @@ export class BillPaymentService {
     idempotencyKey: string;
     correlationId: string;
   }): Promise<{
-    quoteId: string;
-    totalDebitMinor: string;
-    expiresAt: string;
+    quote_id: string;
+    total_debit_minor: string;
+    expires_at: string;
     replayed: boolean;
   }> {
     assertMoney(input.amountMinor);
@@ -170,9 +259,9 @@ export class BillPaymentService {
         expires_at: expiresAt,
       });
       return {
-        quoteId,
-        totalDebitMinor: total,
-        expiresAt: expiresAt.toISOString(),
+        quote_id: quoteId,
+        total_debit_minor: total,
+        expires_at: expiresAt.toISOString(),
         replayed: false,
       };
     });
@@ -182,15 +271,12 @@ export class BillPaymentService {
     tenantId: string;
     customerId: string;
     sourceAccountId: string;
-    providerPayableLedgerAccountId: string;
-    revenueLedgerAccountId?: string;
-    taxLedgerAccountId?: string;
     quoteId: string;
     customerIdentifier: string;
     idempotencyKey: string;
     correlationId: string;
   }): Promise<{
-    billTransactionId: string;
+    bill_transaction_id: string;
     status: string;
     replayed: boolean;
   }> {
@@ -244,14 +330,33 @@ export class BillPaymentService {
           .first<{ ledger_account_id: string }>("ledger_account_id");
         if (!source?.ledger_account_id)
           throw new Error("Source account requires an active Ledger mapping");
-        const product = await tx("bill_products")
-          .where({ tenant_id: input.tenantId, id: quote.product_id })
+        const product = await tx("bill_products as p")
+          .join("bill_providers as bp", function () {
+            this.on("bp.id", "=", "p.provider_id").andOn(
+              "bp.tenant_id",
+              "=",
+              "p.tenant_id",
+            );
+          })
+          .where({ "p.tenant_id": input.tenantId, "p.id": quote.product_id })
           .first<{
             provider_id: string;
             category_id: string;
             product_code: string;
-          }>();
+            provider_payable_ledger_account_id: string | null;
+            revenue_ledger_account_id: string | null;
+            tax_ledger_account_id: string | null;
+          }>(
+            "p.provider_id",
+            "p.category_id",
+            "p.product_code",
+            "bp.provider_payable_ledger_account_id",
+            "bp.revenue_ledger_account_id",
+            "bp.tax_ledger_account_id",
+          );
         if (!product) throw new Error("Quoted product is unavailable");
+        if (!product.provider_payable_ledger_account_id)
+          throw new Error("Bill provider Ledger settlement is not configured");
         const id = randomUUID();
         await tx("bill_transactions").insert({
           id,
@@ -278,9 +383,9 @@ export class BillPaymentService {
           provider_selection_version: quote.catalogue_version,
           source_ledger_account_id: source.ledger_account_id,
           provider_payable_ledger_account_id:
-            input.providerPayableLedgerAccountId,
-          revenue_ledger_account_id: input.revenueLedgerAccountId,
-          tax_ledger_account_id: input.taxLedgerAccountId,
+            product.provider_payable_ledger_account_id,
+          revenue_ledger_account_id: product.revenue_ledger_account_id,
+          tax_ledger_account_id: product.tax_ledger_account_id,
         });
         return {
           row: (await tx("bill_transactions").where({ id }).first<BillRow>())!,
@@ -290,13 +395,17 @@ export class BillPaymentService {
     );
     if (prepared.quoteAlreadyPaid)
       return {
-        billTransactionId: prepared.row.id,
+        bill_transaction_id: prepared.row.id,
         status: prepared.row.status,
         replayed: true,
       };
     const row = prepared.row;
     if (["SUCCESSFUL", "FAILED", "REVERSED", "REFUNDED"].includes(row.status))
-      return { billTransactionId: row.id, status: row.status, replayed: true };
+      return {
+        bill_transaction_id: row.id,
+        status: row.status,
+        replayed: true,
+      };
     const hold = row.ledger_hold_id
       ? { holdId: row.ledger_hold_id }
       : await this.ledger.createHold({
@@ -326,6 +435,17 @@ export class BillPaymentService {
           "c.category",
         ),
     );
+    const validation = quote.validation_id
+      ? await withTenantTransaction(this.db, input.tenantId, (tx) =>
+          tx("bill_customer_validations")
+            .where({
+              tenant_id: input.tenantId,
+              id: quote.validation_id,
+              customer_id: input.customerId,
+            })
+            .first<{ provider_reference: string | null }>("provider_reference"),
+        )
+      : undefined;
     const attemptId = randomUUID();
     const priorAttempt = await withTenantTransaction(
       this.db,
@@ -337,7 +457,7 @@ export class BillPaymentService {
     );
     if (priorAttempt)
       return {
-        billTransactionId: row.id,
+        bill_transaction_id: row.id,
         status: "PROCESSING",
         replayed: true,
       };
@@ -364,6 +484,9 @@ export class BillPaymentService {
         customerIdentifier: input.customerIdentifier,
         amountMinor: quote.amount,
         idempotencyKey: input.idempotencyKey,
+        ...(validation?.provider_reference
+          ? { validationReference: validation.provider_reference }
+          : {}),
       });
     } catch {
       await this.updateAttempt(input.tenantId, attemptId, {
@@ -376,7 +499,7 @@ export class BillPaymentService {
         next_inquiry_at: new Date(Date.now() + 30_000),
       });
       return {
-        billTransactionId: row.id,
+        bill_transaction_id: row.id,
         status: "PROCESSING",
         replayed: false,
       };
@@ -399,7 +522,7 @@ export class BillPaymentService {
         provider_reference: result.providerReference,
         completed_at: this.db.fn.now(),
       });
-      return { billTransactionId: row.id, status: "FAILED", replayed: false };
+      return { bill_transaction_id: row.id, status: "FAILED", replayed: false };
     }
     if (result.state === "PENDING") {
       await this.update(input.tenantId, row.id, {
@@ -415,7 +538,7 @@ export class BillPaymentService {
         next_inquiry_at: new Date(Date.now() + 30_000),
       });
       return {
-        billTransactionId: row.id,
+        bill_transaction_id: row.id,
         status: "PROCESSING",
         replayed: false,
       };
@@ -429,12 +552,12 @@ export class BillPaymentService {
         input.tenantId,
         input.sourceAccountId,
       ),
-      providerPayableAccountId: input.providerPayableLedgerAccountId,
-      ...(input.revenueLedgerAccountId
-        ? { revenueAccountId: input.revenueLedgerAccountId }
+      providerPayableAccountId: row.provider_payable_ledger_account_id!,
+      ...(row.revenue_ledger_account_id
+        ? { revenueAccountId: row.revenue_ledger_account_id }
         : {}),
-      ...(input.taxLedgerAccountId
-        ? { taxAccountId: input.taxLedgerAccountId }
+      ...(row.tax_ledger_account_id
+        ? { taxAccountId: row.tax_ledger_account_id }
         : {}),
       amountMinor: quote.amount,
       feeMinor: quote.fee_amount,
@@ -479,7 +602,11 @@ export class BillPaymentService {
         },
       });
     });
-    return { billTransactionId: row.id, status: "SUCCESSFUL", replayed: false };
+    return {
+      bill_transaction_id: row.id,
+      status: "SUCCESSFUL",
+      replayed: false,
+    };
   }
   private async accountLedger(
     tenantId: string,
@@ -492,6 +619,35 @@ export class BillPaymentService {
     );
     if (!row?.ledger_account_id) throw new Error("Ledger mapping missing");
     return row.ledger_account_id;
+  }
+  private availableProduct(tenantId: string, productId: string) {
+    return withTenantTransaction(this.db, tenantId, (tx) =>
+      tx("bill_products as p")
+        .join("bill_providers as bp", function () {
+          this.on("bp.id", "=", "p.provider_id").andOn(
+            "bp.tenant_id",
+            "=",
+            "p.tenant_id",
+          );
+        })
+        .where({
+          "p.tenant_id": tenantId,
+          "p.id": productId,
+          "p.is_active": true,
+          "bp.is_active": true,
+        })
+        .whereNotNull("p.published_at")
+        .where("p.effective_from", "<=", tx.fn.now())
+        .where((query) =>
+          query
+            .whereNull("p.effective_to")
+            .orWhere("p.effective_to", ">", tx.fn.now()),
+        )
+        .first<{ product_code: string; provider_code: string }>(
+          "p.product_code",
+          "bp.provider_code",
+        ),
+    );
   }
   private update(
     tenantId: string,
@@ -548,9 +704,27 @@ function hash(value: unknown): string {
 /** Maps a stored bill quote to the public quote result. */
 function quoteResult(row: QuoteRow, replayed: boolean) {
   return {
-    quoteId: row.id,
-    totalDebitMinor: row.total_debit,
-    expiresAt: new Date(row.expires_at).toISOString(),
+    quote_id: row.id,
+    total_debit_minor: row.total_debit,
+    expires_at: new Date(row.expires_at).toISOString(),
+    replayed,
+  };
+}
+
+function validationResult(
+  row: {
+    id: string;
+    normalized_customer_name: string | null;
+    expires_at: Date;
+  },
+  replayed: boolean,
+) {
+  return {
+    validation_id: row.id,
+    ...(row.normalized_customer_name
+      ? { customer_name: row.normalized_customer_name }
+      : {}),
+    expires_at: new Date(row.expires_at).toISOString(),
     replayed,
   };
 }

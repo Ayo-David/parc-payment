@@ -49,6 +49,15 @@ export interface VirtualAccountResult {
 export interface VirtualAccountProvider extends PaymentProvider {
   createVirtualAccount(input: unknown): Promise<VirtualAccountResult>;
 }
+export interface TransferDirectoryProvider extends PaymentProvider {
+  listBanks(): Promise<Array<{ name: string; code: string; active: boolean }>>;
+  nameEnquiry(input: { accountNumber: string; bankCode: string }): Promise<{
+    accountName: string;
+    recipientCode?: string;
+    sessionId?: string;
+    kycLevel?: string;
+  }>;
+}
 export class ProviderRegistry {
   private readonly providers = new Map<string, PaymentProvider>();
   public register(provider: PaymentProvider): void {

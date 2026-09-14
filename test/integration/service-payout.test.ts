@@ -30,6 +30,9 @@ describeDatabase("LN-05 service payout ambiguity", () => {
     await db("payment_provider_routing_decisions")
       .where({ tenant_id: tenantId })
       .delete();
+    await db.raw(
+      "ALTER TABLE payment_provider_routing_decisions ENABLE TRIGGER trg_immutable_payment_routing_decision",
+    );
     await db.destroy();
   });
   it("retains a submitted timeout as pending and never creates a second attempt on replay", async () => {

@@ -4,6 +4,7 @@ import type {
   ProviderSubmission,
   VirtualAccountProvider,
   VirtualAccountResult,
+  TransferDirectoryProvider,
 } from "./payment-provider.js";
 import { ProviderOutcomeAmbiguousError } from "./payment-provider.js";
 import { z } from "zod";
@@ -21,7 +22,7 @@ const transferSchema = z.object({
 });
 
 export class PaystackProvider
-  implements PaymentProvider, VirtualAccountProvider
+  implements PaymentProvider, VirtualAccountProvider, TransferDirectoryProvider
 {
   public readonly code = "PAYSTACK";
   public constructor(
@@ -221,6 +222,75 @@ export class PaystackProvider
       accountNumber: accountBody.data.account_number,
       providerCustomerReference: customerBody.data.customer_code,
       providerAccountReference: String(accountBody.data.id),
+    };
+  }
+
+  public async listBanks(): Promise<
+    Array<{ name: string; code: string; active: boolean }>
+  > {
+    const url = new URL("/bank", this.baseUrl);
+    url.searchParams.set("country", "nigeria");
+    url.searchParams.set("currency", "NGN");
+    url.searchParams.set("perPage", "100");
+    const response = await this.http(url, { headers: this.headers() });
+    const body = (await response.json()) as {
+      status?: boolean;
+      data?: Array<{ name?: string; code?: string; active?: boolean }>;
+    };
+    if (!response.ok || body.status !== true || !Array.isArray(body.data))
+      throw new Error(`Paystack bank discovery failed with ${response.status}`);
+    return body.data.flatMap((bank) =>
+      bank.name && bank.code
+        ? [{ name: bank.name, code: bank.code, active: bank.active !== false }]
+        : [],
+    );
+  }
+
+  public async nameEnquiry(input: {
+    accountNumber: string;
+    bankCode: string;
+  }): Promise<{ accountName: string; recipientCode?: string }> {
+    const url = new URL("/bank/resolve", this.baseUrl);
+    url.searchParams.set("account_number", input.accountNumber);
+    url.searchParams.set("bank_code", input.bankCode);
+    const response = await this.http(url, { headers: this.headers() });
+    const body = (await response.json()) as {
+      status?: boolean;
+      data?: { account_name?: string };
+    };
+    if (!response.ok || body.status !== true || !body.data?.account_name)
+      throw new Error(
+        `Paystack account resolution failed with ${response.status}`,
+      );
+    const recipientResponse = await this.http(
+      new URL("/transferrecipient", this.baseUrl),
+      {
+        method: "POST",
+        headers: this.headers(),
+        body: JSON.stringify({
+          type: "nuban",
+          name: body.data.account_name,
+          account_number: input.accountNumber,
+          bank_code: input.bankCode,
+          currency: "NGN",
+        }),
+      },
+    );
+    const recipient = (await recipientResponse.json()) as {
+      status?: boolean;
+      data?: { recipient_code?: string };
+    };
+    if (
+      !recipientResponse.ok ||
+      recipient.status !== true ||
+      !recipient.data?.recipient_code
+    )
+      throw new Error(
+        `Paystack recipient creation failed with ${recipientResponse.status}`,
+      );
+    return {
+      accountName: body.data.account_name,
+      recipientCode: recipient.data.recipient_code,
     };
   }
 

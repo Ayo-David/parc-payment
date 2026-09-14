@@ -6,6 +6,7 @@ import type {
   ProviderSubmission,
   VirtualAccountProvider,
   VirtualAccountResult,
+  TransferDirectoryProvider,
 } from "./payment-provider.js";
 import { ProviderOutcomeAmbiguousError } from "./payment-provider.js";
 
@@ -47,7 +48,7 @@ export type BankOneTransferData = z.infer<typeof transferSchema>;
 export type BankOneAccountData = z.infer<typeof accountSchema>;
 
 export class BankOneProvider
-  implements PaymentProvider, VirtualAccountProvider
+  implements PaymentProvider, VirtualAccountProvider, TransferDirectoryProvider
 {
   public readonly code = "BANKONE";
 
@@ -223,6 +224,12 @@ export class BankOneProvider
       ...(kycLevel ? { kycLevel } : {}),
       ...(sessionId ? { sessionId } : {}),
     };
+  }
+
+  public async listBanks(): Promise<
+    Array<{ name: string; code: string; active: boolean }>
+  > {
+    throw new Error("BankOne bank-directory endpoint is not configured");
   }
 
   private post(base: string, path: string, body: object): Promise<Response> {

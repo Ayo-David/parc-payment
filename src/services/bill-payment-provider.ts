@@ -21,6 +21,7 @@ export interface BillPaymentProvider {
     customerIdentifier: string;
     amountMinor: string;
     idempotencyKey: string;
+    validationReference?: string;
   }): Promise<BillFulfilment>;
   inquire(providerReference: string): Promise<BillFulfilment>;
 }

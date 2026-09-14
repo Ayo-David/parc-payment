@@ -5,6 +5,8 @@ import {
   SandboxBillPaymentProvider,
 } from "../../src/services/bill-payment-provider.js";
 import { BillPaymentService } from "../../src/services/bill-payment-service.js";
+import { BillPaymentInquiryWorker } from "../../src/services/bill-payment-inquiry-worker.js";
+import type { BillPaymentProvider } from "../../src/services/bill-payment-provider.js";
 import type { ProviderRoutingService } from "../../src/services/provider-routing-service.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -17,6 +19,8 @@ describeDatabase("PAY-08 bill payments", () => {
   const accountId = randomUUID();
   const sourceLedgerId = randomUUID();
   const payableLedgerId = randomUUID();
+  const revenueLedgerId = randomUUID();
+  const taxLedgerId = randomUUID();
   const categoryId = randomUUID();
   const providerId = randomUUID();
   const productId = randomUUID();
@@ -39,6 +43,9 @@ describeDatabase("PAY-08 bill payments", () => {
       category_id: categoryId,
       provider_code: "SANDBOX_BILLS",
       provider_name: "Sandbox Bills",
+      provider_payable_ledger_account_id: payableLedgerId,
+      revenue_ledger_account_id: revenueLedgerId,
+      tax_ledger_account_id: taxLedgerId,
     });
     await db("bill_products").insert({
       id: productId,
@@ -171,15 +178,12 @@ describeDatabase("PAY-08 bill payments", () => {
       idempotencyKey: `quote-${tenantId}`,
       correlationId: randomUUID(),
     });
-    expect(quote.totalDebitMinor).toBe("100150");
+    expect(quote.total_debit_minor).toBe("100150");
     const command = {
       tenantId,
       customerId,
       sourceAccountId: accountId,
-      providerPayableLedgerAccountId: payableLedgerId,
-      revenueLedgerAccountId: randomUUID(),
-      taxLedgerAccountId: randomUUID(),
-      quoteId: quote.quoteId,
+      quoteId: quote.quote_id,
       customerIdentifier: "08030000000",
       idempotencyKey: `pay-${tenantId}`,
       correlationId: randomUUID(),
@@ -208,5 +212,86 @@ describeDatabase("PAY-08 bill payments", () => {
         .count<{ count: string }>("*")
         .first(),
     ).toEqual({ count: "1" });
+  });
+
+  it("leases a pending vend, requeries once, and captures the original hold", async () => {
+    const routing = {
+      select: async () => ({
+        provider: { code: "SANDBOX_BILLS" },
+        decisionId: routingDecisionId,
+        replayed: false,
+      }),
+    } as unknown as ProviderRoutingService;
+    const provider: BillPaymentProvider = {
+      code: "SANDBOX_BILLS",
+      validateCustomer: async () => ({ evidence: { valid: true } }),
+      fulfil: async (input) => ({
+        providerReference: `BILL-${input.transactionId}`,
+        state: "PENDING",
+      }),
+      inquire: async (providerReference) => ({
+        providerReference,
+        state: "SUCCESS",
+        token: "TOKEN-123",
+      }),
+    };
+    const registry = new BillPaymentProviderRegistry();
+    registry.register(provider);
+    const calls = { captures: 0, releases: 0 };
+    const ledger = {
+      createHold: async () => ({ holdId: randomUUID(), replayed: false }),
+      captureBillHold: async () => {
+        calls.captures += 1;
+        return { transactionId: randomUUID(), replayed: false };
+      },
+      releaseHold: async () => {
+        calls.releases += 1;
+      },
+    };
+    const service = new BillPaymentService(db, routing, registry, ledger);
+    const quote = await service.createQuote({
+      tenantId,
+      customerId,
+      productId,
+      customerIdentifier: "08031111111",
+      amountMinor: "200000",
+      idempotencyKey: `pending-quote-${tenantId}`,
+      correlationId: randomUUID(),
+    });
+    const submitted = await service.pay({
+      tenantId,
+      customerId,
+      sourceAccountId: accountId,
+      quoteId: quote.quote_id,
+      customerIdentifier: "08031111111",
+      idempotencyKey: `pending-pay-${tenantId}`,
+      correlationId: randomUUID(),
+    });
+    expect(submitted.status).toBe("PROCESSING");
+    await db("bill_transaction_attempts")
+      .where({
+        tenant_id: tenantId,
+        bill_transaction_id: submitted.bill_transaction_id,
+      })
+      .update({ next_inquiry_at: new Date(Date.now() - 1_000) });
+
+    const worker = new BillPaymentInquiryWorker(
+      db,
+      registry,
+      ledger,
+      "bill-worker-test",
+    );
+    await expect(worker.runBatch()).resolves.toBe(1);
+    await expect(worker.runBatch()).resolves.toBe(0);
+    expect(calls).toEqual({ captures: 1, releases: 0 });
+    await expect(
+      db("bill_transactions")
+        .where({ tenant_id: tenantId, id: submitted.bill_transaction_id })
+        .first("status", "outcome_class", "response_payload"),
+    ).resolves.toMatchObject({
+      status: "SUCCESSFUL",
+      outcome_class: "FINAL_SUCCESS",
+      response_payload: { token: "TOKEN-123" },
+    });
   });
 });
