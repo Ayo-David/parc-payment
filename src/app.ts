@@ -94,12 +94,17 @@ export function createApp(
     res.json({ status: "UP", service: "parc-payment" }),
   );
   if (internalApi) {
-    const internal = internalApi.access.require(
-      paymentAccessPolicies.billCatalogue,
-    );
+    const internal: express.RequestHandler[] = [
+      internalApi.access.require(paymentAccessPolicies.billCatalogue),
+      (req, res, next) => {
+        if (principalOf(req).tenantId !== req.params.tenantId)
+          return void res.status(403).json({ code: "TENANT_MISMATCH" });
+        next();
+      },
+    ];
     app.post(
       "/internal/v1/tenants/:tenantId/bill-catalogue/imports",
-      internal,
+      ...internal,
       async (req, res, next) => {
         try {
           const result = await internalApi.catalogues.importDraft({
@@ -115,7 +120,7 @@ export function createApp(
     );
     app.get(
       "/internal/v1/tenants/:tenantId/bill-catalogue/imports/:id/publication-binding",
-      internal,
+      ...internal,
       async (req, res, next) => {
         try {
           res.json(
@@ -131,7 +136,7 @@ export function createApp(
     );
     app.post(
       "/internal/v1/tenants/:tenantId/bill-catalogue/imports/:id/publications",
-      internal,
+      ...internal,
       async (req, res, next) => {
         try {
           const body = z
@@ -156,10 +161,12 @@ export function createApp(
   if (customerApi) {
     const customer = (policy: AccessPolicy): express.RequestHandler[] => [
       customerApi.access.require(policy),
-      (req, _res, next) => {
-        const subject = principalOf(req).subject;
-        const tenantId = req.header("x-tenant-id");
-        if (!subject || !tenantId) throw new Error("UNAUTHORIZED");
+      (req, res, next) => {
+        const { subject, tenantId } = principalOf(req);
+        if (!subject || !tenantId)
+          return void res
+            .status(403)
+            .json({ code: "CUSTOMER_CONTEXT_REQUIRED" });
         (
           req as express.Request & {
             paymentCustomer?: PaymentCustomerPrincipal;

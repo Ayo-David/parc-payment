@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import knex from "knex";
 import { z } from "zod";
+import { withTenantTransaction } from "../src/database/client.js";
 import { CollectionService } from "../src/services/collection-service.js";
 import { HttpLedgerPostingGateway } from "../src/services/ledger-gateway.js";
 import { ParcTokenClient } from "../src/security/parc-service-auth.js";
@@ -116,58 +117,62 @@ try {
     const walletAccountId = z.string().uuid().parse(wallet.account_id);
     const settlementAccountId = z.string().uuid().parse(settlement.account_id);
 
-    await database.transaction(async (transaction) => {
-      await transaction("account_providers")
-        .insert({
-          id: fixture.providerId,
-          tenant_id: fixture.tenantId,
-          provider_code: "PAYSTACK",
-          provider_name: "Paystack PR-01 simulator",
-          provider_type: "PAYMENT_PROCESSOR",
-          is_active: true,
-          configuration: JSON.stringify({ fixture: "PR-01" }),
-        })
-        .onConflict("id")
-        .merge({ is_active: true, updated_at: transaction.fn.now() });
+    await withTenantTransaction(
+      database,
+      fixture.tenantId,
+      async (transaction) => {
+        await transaction("account_providers")
+          .insert({
+            id: fixture.providerId,
+            tenant_id: fixture.tenantId,
+            provider_code: "PAYSTACK",
+            provider_name: "Paystack PR-01 simulator",
+            provider_type: "PAYMENT_PROCESSOR",
+            is_active: true,
+            configuration: JSON.stringify({ fixture: "PR-01" }),
+          })
+          .onConflict("id")
+          .merge({ is_active: true, updated_at: transaction.fn.now() });
 
-      await transaction("financial_accounts")
-        .insert({
-          id: fixture.financialAccountId,
-          tenant_id: fixture.tenantId,
-          customer_id: fixture.customerId,
-          provider_id: fixture.providerId,
-          account_type: "VIRTUAL_BANK_ACCOUNT",
-          account_number: fixture.accountNumber,
-          account_name: "PR-01 Fixture Customer",
-          bank_code: "999",
-          bank_name: "Paystack Test Bank",
-          currency: "NGN",
-          status: "ACTIVE",
-          provider_reference: fixture.providerReference,
-          is_primary: true,
-          ledger_account_id: walletAccountId,
-          metadata: JSON.stringify({ fixture: "PR-01", disposable: true }),
-        })
-        .onConflict("id")
-        .merge({
-          status: "ACTIVE",
-          ledger_account_id: walletAccountId,
-          updated_at: transaction.fn.now(),
-        });
+        await transaction("financial_accounts")
+          .insert({
+            id: fixture.financialAccountId,
+            tenant_id: fixture.tenantId,
+            customer_id: fixture.customerId,
+            provider_id: fixture.providerId,
+            account_type: "VIRTUAL_BANK_ACCOUNT",
+            account_number: fixture.accountNumber,
+            account_name: "PR-01 Fixture Customer",
+            bank_code: "999",
+            bank_name: "Paystack Test Bank",
+            currency: "NGN",
+            status: "ACTIVE",
+            provider_reference: fixture.providerReference,
+            is_primary: true,
+            ledger_account_id: walletAccountId,
+            metadata: JSON.stringify({ fixture: "PR-01", disposable: true }),
+          })
+          .onConflict("id")
+          .merge({
+            status: "ACTIVE",
+            ledger_account_id: walletAccountId,
+            updated_at: transaction.fn.now(),
+          });
 
-      await transaction("account_provider_accounts")
-        .insert({
-          id: fixture.providerAccountId,
-          tenant_id: fixture.tenantId,
-          account_id: fixture.financialAccountId,
-          provider_id: fixture.providerId,
-          provider_account_id: fixture.providerReference,
-          provider_account_number: fixture.accountNumber,
-          provider_metadata: JSON.stringify({ fixture: "PR-01" }),
-        })
-        .onConflict("id")
-        .ignore();
-    });
+        await transaction("account_provider_accounts")
+          .insert({
+            id: fixture.providerAccountId,
+            tenant_id: fixture.tenantId,
+            account_id: fixture.financialAccountId,
+            provider_id: fixture.providerId,
+            provider_account_id: fixture.providerReference,
+            provider_account_number: fixture.accountNumber,
+            provider_metadata: JSON.stringify({ fixture: "PR-01" }),
+          })
+          .onConflict("id")
+          .ignore();
+      },
+    );
 
     const evidence = {
       provider: "PAYSTACK",

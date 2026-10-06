@@ -105,6 +105,8 @@ export class InternalTransferService {
           throw new Error(
             "Both internal-transfer accounts require Ledger mappings",
           );
+        if (source.id === destination.id)
+          throw new Error("Source and destination accounts must differ");
         const paymentId = randomUUID();
         const transferId = randomUUID();
         await tx("payment_transactions").insert({
