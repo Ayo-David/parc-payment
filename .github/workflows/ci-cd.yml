@@ -215,8 +215,9 @@ jobs:
               --network host \
               -e NODE_ENV \
               -e DATABASE_URL \
+              -e KNEX_MIGRATIONS_COMPILED=true \
               "$IMAGE_URI" \
-              yarn migrate:runtime
+              node node_modules/knex/bin/cli.js --knexfile dist/knexfile.js migrate:latest
 
             # --- STEP 2: SWAP APPLICATION CONTAINERS ---
             echo "Replacing application containers..."
