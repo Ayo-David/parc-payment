@@ -1,3 +1,4 @@
+import type { ParcTokenClient } from "../security/parc-service-auth.js";
 export interface LedgerPostingGateway {
   post(input: {
     tenantId: string;
@@ -74,7 +75,7 @@ export class HttpLedgerPostingGateway
 {
   public constructor(
     private readonly baseUrl: string,
-    private readonly serviceToken: string,
+    private readonly tokens: Pick<ParcTokenClient, "authorization">,
     private readonly http: typeof fetch = fetch,
   ) {}
 
@@ -92,7 +93,10 @@ export class HttpLedgerPostingGateway
       {
         method: "POST",
         headers: {
-          "x-internal-service-token": this.serviceToken,
+          authorization: await this.authorization(
+            "/internal/v1/postings",
+            input.tenantId,
+          ),
           "content-type": "application/json",
           "x-tenant-id": input.tenantId,
           "x-calling-service": "parc-payment",
@@ -300,7 +304,22 @@ export class HttpLedgerPostingGateway
     };
   }
 
-  private request(
+  /** Delegated while serving a customer request, service-only otherwise. */
+  private authorization(path: string, tenantId: string): Promise<string> {
+    return this.tokens.authorization({
+      audience: "parc-ledger",
+      scopes: [
+        path.endsWith("/reversals")
+          ? "ledger.reversals.write"
+          : path === "/internal/v1/accounts"
+            ? "ledger.accounts.provision"
+            : "ledger.postings.write",
+      ],
+      tenantId,
+    });
+  }
+
+  private async request(
     path: string,
     identity: { tenantId: string; idempotencyKey: string },
     body?: object,
@@ -308,7 +327,7 @@ export class HttpLedgerPostingGateway
     return this.http(new URL(path, this.baseUrl), {
       method: "POST",
       headers: {
-        "x-internal-service-token": this.serviceToken,
+        authorization: await this.authorization(path, identity.tenantId),
         "content-type": "application/json",
         "x-tenant-id": identity.tenantId,
         "x-calling-service": "parc-payment",

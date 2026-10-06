@@ -12,5 +12,5 @@
     "skipLibCheck": true,
     "types": ["node", "jest"]
   },
-  "include": ["src/**/*.ts", "test/**/*.ts", "knexfile.ts"]
+  "include": ["src/**/*.ts", "test/**/*.ts", "scripts/**/*.ts", "knexfile.ts"]
 }

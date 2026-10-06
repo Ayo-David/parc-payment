@@ -79,7 +79,7 @@ describeDatabase("PAY-06 external transfers", () => {
   const command = (idempotencyKey: string) => ({
     tenantId,
     customerId,
-    sourceAccountId,
+    sourceAccountId: sourceLedgerId,
     settlementLedgerAccountId: settlementLedgerId,
     beneficiaryName: "Synthetic Receiver",
     destinationAccountNumber: "3000000002",

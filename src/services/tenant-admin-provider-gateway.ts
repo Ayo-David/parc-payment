@@ -1,3 +1,4 @@
+import type { ParcTokenClient } from "../security/parc-service-auth.js";
 import type { PaymentCapability } from "./payment-provider.js";
 export interface ProviderSelection {
   id: string;
@@ -20,7 +21,7 @@ export interface ProviderSelectionGateway {
 export class TenantAdminProviderGateway implements ProviderSelectionGateway {
   public constructor(
     private readonly baseUrl: string,
-    private readonly token: string,
+    private readonly tokens: Pick<ParcTokenClient, "authorization">,
   ) {}
   public async resolve(
     tenantId: string,
@@ -30,8 +31,13 @@ export class TenantAdminProviderGateway implements ProviderSelectionGateway {
     const path = `/internal/v1/tenants/${tenantId}/provider-selection/${capability}?currency=${encodeURIComponent(currency)}`;
     const response = await fetch(new URL(path, this.baseUrl), {
       headers: {
-        "x-service-token": this.token,
-        "x-service-name": "parc-payment",
+        authorization: await this.tokens.authorization({
+          audience: "parc-tenant-admin",
+          scopes: ["tenant.provider-selection.read"],
+          tenantId,
+        }),
+        "x-calling-service": "parc-payment",
+        "x-tenant-id": tenantId,
       },
     });
     if (!response.ok)
@@ -58,7 +64,7 @@ export interface ApprovalConsumptionGateway {
 export class TenantAdminApprovalGateway implements ApprovalConsumptionGateway {
   public constructor(
     private readonly baseUrl: string,
-    private readonly token: string,
+    private readonly tokens: Pick<ParcTokenClient, "authorization">,
   ) {}
 
   public async consume(
@@ -76,8 +82,12 @@ export class TenantAdminApprovalGateway implements ApprovalConsumptionGateway {
           "idempotency-key": input.idempotencyKey,
           "x-correlation-id": input.correlationId,
           "x-tenant-id": input.tenantId,
-          "x-service-token": this.token,
-          "x-service-name": "parc-payment",
+          authorization: await this.tokens.authorization({
+            audience: "parc-tenant-admin",
+            scopes: ["tenant.approvals.consume"],
+            tenantId: input.tenantId,
+          }),
+          "x-calling-service": "parc-payment",
         },
         body: JSON.stringify({
           action: input.action,

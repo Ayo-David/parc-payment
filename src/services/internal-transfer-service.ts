@@ -70,39 +70,48 @@ export class InternalTransferService {
             );
           return existing;
         }
-        const accounts = await tx("financial_accounts")
+        const source = await tx("financial_accounts")
           .where({
             tenant_id: input.tenantId,
+            customer_id: input.customerId,
             currency: input.currency,
             status: "ACTIVE",
           })
-          .whereIn("id", [input.sourceAccountId, input.destinationAccountId])
-          .select<
-            {
-              id: string;
-              customer_id: string;
-              ledger_account_id: string | null;
-            }[]
-          >("id", "customer_id", "ledger_account_id");
-        const source = accounts.find(
-          (account) => account.id === input.sourceAccountId,
-        );
-        const destination = accounts.find(
-          (account) => account.id === input.destinationAccountId,
-        );
+          .whereNull("deleted_at")
+          .andWhere((builder) =>
+            builder
+              .where("ledger_account_id", input.sourceAccountId)
+              .orWhere("id", input.sourceAccountId),
+          )
+          .first<{
+            id: string;
+            customer_id: string;
+            ledger_account_id: string | null;
+          }>("id", "customer_id", "ledger_account_id");
+        const destination = await tx("financial_accounts")
+          .where({
+            tenant_id: input.tenantId,
+            id: input.destinationAccountId,
+            currency: input.currency,
+            status: "ACTIVE",
+          })
+          .whereNull("deleted_at")
+          .first<{
+            id: string;
+            customer_id: string;
+            ledger_account_id: string | null;
+          }>("id", "customer_id", "ledger_account_id");
         if (!source?.ledger_account_id || !destination?.ledger_account_id)
           throw new Error(
             "Both internal-transfer accounts require Ledger mappings",
           );
-        if (source.customer_id !== input.customerId)
-          throw new Error("Customer does not own the source account");
         const paymentId = randomUUID();
         const transferId = randomUUID();
         await tx("payment_transactions").insert({
           id: paymentId,
           tenant_id: input.tenantId,
           customer_id: input.customerId,
-          source_account_id: input.sourceAccountId,
+          source_account_id: source.id,
           payment_type: "INTERNAL_TRANSFER",
           channel: "MOBILE_APP",
           amount: input.amountMinor,
@@ -118,7 +127,7 @@ export class InternalTransferService {
           tenant_id: input.tenantId,
           payment_id: paymentId,
           customer_id: input.customerId,
-          source_account_id: input.sourceAccountId,
+          source_account_id: source.id,
           destination_account_id: input.destinationAccountId,
           source_ledger_account_id: source.ledger_account_id,
           destination_ledger_account_id: destination.ledger_account_id,

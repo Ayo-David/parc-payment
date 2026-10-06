@@ -322,12 +322,20 @@ export class BillPaymentService {
         const source = await tx("financial_accounts")
           .where({
             tenant_id: input.tenantId,
-            id: input.sourceAccountId,
             customer_id: input.customerId,
             currency: "NGN",
             status: "ACTIVE",
           })
-          .first<{ ledger_account_id: string }>("ledger_account_id");
+          .whereNull("deleted_at")
+          .andWhere((builder) =>
+            builder
+              .where("ledger_account_id", input.sourceAccountId)
+              .orWhere("id", input.sourceAccountId),
+          )
+          .first<{ id: string; ledger_account_id: string }>(
+            "id",
+            "ledger_account_id",
+          );
         if (!source?.ledger_account_id)
           throw new Error("Source account requires an active Ledger mapping");
         const product = await tx("bill_products as p")
@@ -362,7 +370,7 @@ export class BillPaymentService {
           id,
           tenant_id: input.tenantId,
           customer_id: input.customerId,
-          source_account_id: input.sourceAccountId,
+          source_account_id: source.id,
           category_id: product.category_id,
           provider_id: product.provider_id,
           product_id: quote.product_id,

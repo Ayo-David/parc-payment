@@ -2,7 +2,10 @@ import type { Knex } from "knex";
 
 /** Previously approved general Payment inbox for versioned cross-service events. */
 export async function up(knex: Knex): Promise<void> {
-  if (await knex.schema.hasTable("payment_inbox_events")) return;
+  if (await knex.schema.hasTable("payment_inbox_events")) {
+    await hardenInbox(knex);
+    return;
+  }
   await knex.raw(`
     CREATE TYPE public.payment_inbox_status_enum AS ENUM
       ('RECEIVED','PROCESSING','PROCESSED','FAILED','DEAD_LETTER');
@@ -29,6 +32,22 @@ export async function up(knex: Knex): Promise<void> {
     CREATE POLICY payment_inbox_tenant_policy ON public.payment_inbox_events
       USING(tenant_id=public.current_tenant_id()) WITH CHECK(tenant_id=public.current_tenant_id());
     REVOKE ALL ON public.payment_inbox_events FROM PUBLIC,parc_payment_runtime,parc_payment_readonly;
+    GRANT SELECT,INSERT,UPDATE ON public.payment_inbox_events TO parc_payment_worker;
+    GRANT SELECT ON public.payment_inbox_events TO parc_payment_readonly;
+  `);
+}
+
+async function hardenInbox(knex: Knex): Promise<void> {
+  await knex.raw(`
+    ALTER TABLE public.payment_inbox_events ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE public.payment_inbox_events FORCE ROW LEVEL SECURITY;
+    DO $policy$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='payment_inbox_events' AND policyname='payment_inbox_tenant_policy') THEN
+        CREATE POLICY payment_inbox_tenant_policy ON public.payment_inbox_events
+          USING(tenant_id=public.current_tenant_id()) WITH CHECK(tenant_id=public.current_tenant_id());
+      END IF;
+    END $policy$;
+    REVOKE ALL ON public.payment_inbox_events FROM PUBLIC,parc_payment_runtime,parc_payment_readonly,parc_payment_worker;
     GRANT SELECT,INSERT,UPDATE ON public.payment_inbox_events TO parc_payment_worker;
     GRANT SELECT ON public.payment_inbox_events TO parc_payment_readonly;
   `);

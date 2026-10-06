@@ -5,6 +5,7 @@ import { BillPaymentInquiryWorker } from "../services/bill-payment-inquiry-worke
 import { HttpLedgerPostingGateway } from "../services/ledger-gateway.js";
 import { MonnifyBillPaymentProvider } from "../services/monnify-bill-payment-provider.js";
 import pino from "pino";
+import { ParcTokenClient } from "../security/parc-service-auth.js";
 
 const config = loadConfig();
 const database = createDatabase(config);
@@ -20,7 +21,17 @@ providers.register(
 const worker = new BillPaymentInquiryWorker(
   database,
   providers,
-  new HttpLedgerPostingGateway(config.LEDGER_URL, config.LEDGER_SERVICE_TOKEN),
+  // Background worker: service-only tokens.
+  new HttpLedgerPostingGateway(
+    config.LEDGER_URL,
+    await ParcTokenClient.fromBase64Key({
+      tokenUrl: config.AUTH_TOKEN_URL,
+      issuer: config.AUTH_JWT_ISSUER,
+      clientId: config.SERVICE_NAME,
+      keyId: config.SERVICE_CLIENT_KEY_ID,
+      privateKeyBase64: config.SERVICE_CLIENT_PRIVATE_KEY_BASE64,
+    }),
+  ),
   config.BILL_INQUIRY_WORKER_ID,
 );
 
