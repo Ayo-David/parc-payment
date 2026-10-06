@@ -3,7 +3,10 @@ import { createApp } from "./app.js";
 import { loadConfig } from "./config/env.js";
 import { createDatabase } from "./database/client.js";
 import { PaystackWebhookService } from "./services/paystack-webhook-service.js";
-import { HttpPaymentCustomerAuthenticator } from "./services/customer-token-authenticator.js";
+import {
+  createParcAuth,
+  ParcTokenClient,
+} from "./security/parc-service-auth.js";
 import { CustomerPaymentQueryService } from "./services/customer-payment-query-service.js";
 import { CustomerBillQueryService } from "./services/customer-bill-query-service.js";
 import { BillPaymentProviderRegistry } from "./services/bill-payment-provider.js";
@@ -19,6 +22,18 @@ import { BillPaymentService } from "./services/bill-payment-service.js";
 import { BillCatalogueService } from "./services/bill-catalogue-service.js";
 const config = loadConfig();
 const database = createDatabase(config);
+const tokens = await ParcTokenClient.fromBase64Key({
+  tokenUrl: config.AUTH_TOKEN_URL,
+  issuer: config.AUTH_JWT_ISSUER,
+  clientId: config.SERVICE_NAME,
+  keyId: config.SERVICE_CLIENT_KEY_ID,
+  privateKeyBase64: config.SERVICE_CLIENT_PRIVATE_KEY_BASE64,
+});
+const access = createParcAuth({
+  issuer: config.AUTH_JWT_ISSUER,
+  audience: config.SERVICE_NAME,
+  jwksUrl: config.AUTH_JWKS_URL,
+});
 const monnify = new MonnifyBillPaymentProvider(
   config.MONNIFY_BASE_URL,
   config.MONNIFY_API_KEY,
@@ -30,17 +45,14 @@ const paymentProviders = new ProviderRegistry();
 paymentProviders.register(monnify);
 const routing = new ProviderRoutingService(
   database,
-  new TenantAdminProviderGateway(
-    config.TENANT_ADMIN_URL,
-    config.TENANT_ADMIN_SERVICE_TOKEN,
-  ),
+  new TenantAdminProviderGateway(config.TENANT_ADMIN_URL, tokens),
   paymentProviders,
 );
 const billCommands = new BillPaymentService(
   database,
   routing,
   billProviders,
-  new HttpLedgerPostingGateway(config.LEDGER_URL, config.LEDGER_SERVICE_TOKEN),
+  new HttpLedgerPostingGateway(config.LEDGER_URL, tokens),
 );
 const server = createServer(
   createApp(
@@ -50,10 +62,7 @@ const server = createServer(
       config.PAYSTACK_KEY_VERSION,
     ),
     {
-      authenticator: new HttpPaymentCustomerAuthenticator(
-        config.AUTH_CUSTOMER_URL,
-        config.AUTH_CUSTOMER_SERVICE_TOKEN ?? config.TENANT_ADMIN_SERVICE_TOKEN,
-      ),
+      access,
       queries: new CustomerPaymentQueryService(database),
       bills: {
         commands: billCommands,
@@ -61,14 +70,11 @@ const server = createServer(
       },
     },
     {
-      serviceToken: config.PAYMENT_ADMIN_SERVICE_TOKEN,
+      access,
       catalogues: new BillCatalogueService(
         database,
         monnify,
-        new TenantAdminApprovalGateway(
-          config.TENANT_ADMIN_URL,
-          config.TENANT_ADMIN_SERVICE_TOKEN,
-        ),
+        new TenantAdminApprovalGateway(config.TENANT_ADMIN_URL, tokens),
       ),
     },
   ),

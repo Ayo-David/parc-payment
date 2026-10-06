@@ -24,6 +24,7 @@ type QuoteRow = {
 type BillRow = {
   id: string;
   status: string;
+  source_ledger_account_id: string;
   quote_id: string | null;
   idempotency_key: string;
   request_hash: string;
@@ -322,12 +323,20 @@ export class BillPaymentService {
         const source = await tx("financial_accounts")
           .where({
             tenant_id: input.tenantId,
-            id: input.sourceAccountId,
             customer_id: input.customerId,
             currency: "NGN",
             status: "ACTIVE",
           })
-          .first<{ ledger_account_id: string }>("ledger_account_id");
+          .whereNull("deleted_at")
+          .andWhere((builder) =>
+            builder
+              .where("ledger_account_id", input.sourceAccountId)
+              .orWhere("id", input.sourceAccountId),
+          )
+          .first<{ id: string; ledger_account_id: string }>(
+            "id",
+            "ledger_account_id",
+          );
         if (!source?.ledger_account_id)
           throw new Error("Source account requires an active Ledger mapping");
         const product = await tx("bill_products as p")
@@ -362,7 +371,7 @@ export class BillPaymentService {
           id,
           tenant_id: input.tenantId,
           customer_id: input.customerId,
-          source_account_id: input.sourceAccountId,
+          source_account_id: source.id,
           category_id: product.category_id,
           provider_id: product.provider_id,
           product_id: quote.product_id,
@@ -411,10 +420,7 @@ export class BillPaymentService {
       : await this.ledger.createHold({
           tenantId: input.tenantId,
           idempotencyKey: `bill:${row.id}:hold`,
-          accountId: await this.accountLedger(
-            input.tenantId,
-            input.sourceAccountId,
-          ),
+          accountId: row.source_ledger_account_id,
           amountMinor: quote.total_debit,
           currency: "NGN",
           purpose: "BILL_PAYMENT",
@@ -548,10 +554,7 @@ export class BillPaymentService {
       idempotencyKey: `bill:${row.id}:capture`,
       holdId: hold.holdId,
       reference: `BILL-${row.id}`,
-      sourceAccountId: await this.accountLedger(
-        input.tenantId,
-        input.sourceAccountId,
-      ),
+      sourceAccountId: row.source_ledger_account_id,
       providerPayableAccountId: row.provider_payable_ledger_account_id!,
       ...(row.revenue_ledger_account_id
         ? { revenueAccountId: row.revenue_ledger_account_id }
@@ -607,18 +610,6 @@ export class BillPaymentService {
       status: "SUCCESSFUL",
       replayed: false,
     };
-  }
-  private async accountLedger(
-    tenantId: string,
-    accountId: string,
-  ): Promise<string> {
-    const row = await withTenantTransaction(this.db, tenantId, (tx) =>
-      tx("financial_accounts")
-        .where({ tenant_id: tenantId, id: accountId })
-        .first<{ ledger_account_id: string }>("ledger_account_id"),
-    );
-    if (!row?.ledger_account_id) throw new Error("Ledger mapping missing");
-    return row.ledger_account_id;
   }
   private availableProduct(tenantId: string, productId: string) {
     return withTenantTransaction(this.db, tenantId, (tx) =>

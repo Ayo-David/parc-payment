@@ -30,7 +30,15 @@ export class CustomerPaymentQueryService {
   public fundingDetails(
     tenantId: string,
     customerId: string,
-  ): Promise<unknown> {
+  ): Promise<{
+    id: string;
+    source_account_id: string;
+    account_number: string;
+    account_name: string;
+    bank_code: string;
+    bank_name: string;
+    currency: string;
+  }> {
     return withTenantTransaction(this.db, tenantId, async (tx) => {
       const row = await tx("financial_accounts")
         .where({
@@ -40,16 +48,18 @@ export class CustomerPaymentQueryService {
           status: "ACTIVE",
         })
         .whereNull("deleted_at")
+        .whereNotNull("ledger_account_id")
         .orderBy("is_primary", "desc")
         .orderBy("created_at")
-        .first(
-          "id",
-          "account_number",
-          "account_name",
-          "bank_code",
-          "bank_name",
-          "currency",
-        );
+        .first({
+          id: "id",
+          source_account_id: "ledger_account_id",
+          account_number: "account_number",
+          account_name: "account_name",
+          bank_code: "bank_code",
+          bank_name: "bank_name",
+          currency: "currency",
+        });
       if (!row) throw new Error("FUNDING_ACCOUNT_NOT_FOUND");
       return row;
     });

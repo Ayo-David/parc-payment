@@ -95,12 +95,20 @@ export class ExternalTransferService {
         const source = await tx("financial_accounts")
           .where({
             tenant_id: input.tenantId,
-            id: input.sourceAccountId,
             customer_id: input.customerId,
             currency: input.currency,
             status: "ACTIVE",
           })
-          .first<{ ledger_account_id: string | null }>("ledger_account_id");
+          .whereNull("deleted_at")
+          .andWhere((builder) =>
+            builder
+              .where("ledger_account_id", input.sourceAccountId)
+              .orWhere("id", input.sourceAccountId),
+          )
+          .first<{ id: string; ledger_account_id: string | null }>(
+            "id",
+            "ledger_account_id",
+          );
         if (!source?.ledger_account_id)
           throw new Error("Source account requires an active Ledger mapping");
         if (input.beneficiaryId) {
@@ -121,7 +129,7 @@ export class ExternalTransferService {
           id: paymentId,
           tenant_id: input.tenantId,
           customer_id: input.customerId,
-          source_account_id: input.sourceAccountId,
+          source_account_id: source.id,
           ...(input.beneficiaryId
             ? { beneficiary_id: input.beneficiaryId }
             : {}),
@@ -140,7 +148,7 @@ export class ExternalTransferService {
           tenant_id: input.tenantId,
           payment_id: paymentId,
           customer_id: input.customerId,
-          source_account_id: input.sourceAccountId,
+          source_account_id: source.id,
           source_ledger_account_id: source.ledger_account_id,
           settlement_ledger_account_id: input.settlementLedgerAccountId,
           ...(input.beneficiaryId

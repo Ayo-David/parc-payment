@@ -7,12 +7,18 @@ const schema = z.object({
   HOST: z.string().default("0.0.0.0"),
   DATABASE_URL: z.string().default("postgresql:///parc_payment"),
   TENANT_ADMIN_URL: z.string().url().default("http://127.0.0.1:3002"),
-  TENANT_ADMIN_SERVICE_TOKEN: z.string().min(24),
-  PAYMENT_ADMIN_SERVICE_TOKEN: z.string().min(24),
   LEDGER_URL: z.string().url().default("http://127.0.0.1:3003"),
-  LEDGER_SERVICE_TOKEN: z.string().min(24),
-  AUTH_CUSTOMER_URL: z.string().url().default("http://127.0.0.1:3001"),
-  AUTH_CUSTOMER_SERVICE_TOKEN: z.string().min(24).optional(),
+  AUTH_JWKS_URL: z
+    .string()
+    .url()
+    .default("http://127.0.0.1:3001/.well-known/jwks.json"),
+  AUTH_JWT_ISSUER: z.string().url().default("https://auth.parc.invalid"),
+  AUTH_TOKEN_URL: z
+    .string()
+    .url()
+    .default("http://127.0.0.1:3001/internal/v1/oauth/token"),
+  SERVICE_CLIENT_KEY_ID: z.string().min(1),
+  SERVICE_CLIENT_PRIVATE_KEY_BASE64: z.string().min(1),
   PAYSTACK_SECRET_KEY: z.string().min(12),
   PAYSTACK_BASE_URL: z.string().url().default("https://api.paystack.co"),
   PAYSTACK_KEY_VERSION: z.string().min(1).default("default"),

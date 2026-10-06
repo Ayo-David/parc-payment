@@ -182,7 +182,7 @@ describeDatabase("PAY-08 bill payments", () => {
     const command = {
       tenantId,
       customerId,
-      sourceAccountId: accountId,
+      sourceAccountId: sourceLedgerId,
       quoteId: quote.quote_id,
       customerIdentifier: "08030000000",
       idempotencyKey: `pay-${tenantId}`,
@@ -261,7 +261,7 @@ describeDatabase("PAY-08 bill payments", () => {
     const submitted = await service.pay({
       tenantId,
       customerId,
-      sourceAccountId: accountId,
+      sourceAccountId: sourceLedgerId,
       quoteId: quote.quote_id,
       customerIdentifier: "08031111111",
       idempotencyKey: `pending-pay-${tenantId}`,

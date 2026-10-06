@@ -1,29 +1,61 @@
 import express, { type Express } from "express";
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import helmet from "helmet";
 import type { PaystackWebhookService } from "./services/paystack-webhook-service.js";
 import { z } from "zod";
-import type {
-  PaymentCustomerAuthenticator,
-  PaymentCustomerPrincipal,
-} from "./services/customer-token-authenticator.js";
+import {
+  principalOf,
+  type AccessPolicy,
+} from "./security/parc-service-auth.js";
 import type { CustomerPaymentQueryService } from "./services/customer-payment-query-service.js";
 import type { CustomerBillQueryService } from "./services/customer-bill-query-service.js";
 import type { BillPaymentService } from "./services/bill-payment-service.js";
 import type { BillCatalogueService } from "./services/bill-catalogue-service.js";
 
+export interface PaymentCustomerPrincipal {
+  tenantId: string;
+  customerId: string;
+}
+
+/** Inbound Auth-issued token validation (see parc-service-auth). */
+export interface PaymentAccess {
+  require(policy: AccessPolicy): express.RequestHandler;
+}
+
+/** Payment endpoint permissions: the user and acting service from one token. */
+export const paymentAccessPolicies = {
+  customerRead: {
+    scopes: ["payment.customer.read"],
+    kinds: ["delegated"],
+    subjectTypes: ["CUSTOMER"],
+    actors: ["parc-mobile-bff"],
+  },
+  customerWrite: {
+    scopes: ["payment.customer.write"],
+    kinds: ["delegated"],
+    subjectTypes: ["CUSTOMER"],
+    actors: ["parc-mobile-bff"],
+  },
+  billCatalogue: {
+    scopes: ["payment.bill-catalogue.manage"],
+    kinds: ["delegated"],
+    subjectTypes: ["ADMINISTRATOR"],
+    actors: ["parc-admin-bff"],
+  },
+} satisfies Record<string, AccessPolicy>;
+
 /** Builds the payment HTTP application with webhook and health routes. */
 export function createApp(
   webhooks: PaystackWebhookService,
   customerApi?: {
-    authenticator: PaymentCustomerAuthenticator;
+    access: PaymentAccess;
     queries: CustomerPaymentQueryService;
     bills?: {
       commands: BillPaymentService;
       queries: CustomerBillQueryService;
     };
   },
-  internalApi?: { serviceToken: string; catalogues: BillCatalogueService },
+  internalApi?: { access: PaymentAccess; catalogues: BillCatalogueService },
 ): Express {
   const app = express();
   app.disable("x-powered-by");
@@ -62,28 +94,22 @@ export function createApp(
     res.json({ status: "UP", service: "parc-payment" }),
   );
   if (internalApi) {
-    const internal = (
-      req: express.Request,
-      res: express.Response,
-      next: express.NextFunction,
-    ) => {
-      if (
-        !sameSecret(
-          req.header("x-service-token") ?? "",
-          internalApi.serviceToken,
-        )
-      )
-        return void res.status(401).json({ code: "UNAUTHORIZED_SERVICE" });
-      next();
-    };
+    const internal: express.RequestHandler[] = [
+      internalApi.access.require(paymentAccessPolicies.billCatalogue),
+      (req, res, next) => {
+        if (principalOf(req).tenantId !== req.params.tenantId)
+          return void res.status(403).json({ code: "TENANT_MISMATCH" });
+        next();
+      },
+    ];
     app.post(
       "/internal/v1/tenants/:tenantId/bill-catalogue/imports",
-      internal,
+      ...internal,
       async (req, res, next) => {
         try {
           const result = await internalApi.catalogues.importDraft({
             tenantId: z.string().uuid().parse(req.params.tenantId),
-            actorId: z.string().uuid().parse(req.header("x-actor-id")),
+            actorId: administratorId(req),
             idempotencyKey: idempotency(req),
           });
           res.status(result.replayed ? 200 : 201).json(result);
@@ -94,7 +120,7 @@ export function createApp(
     );
     app.get(
       "/internal/v1/tenants/:tenantId/bill-catalogue/imports/:id/publication-binding",
-      internal,
+      ...internal,
       async (req, res, next) => {
         try {
           res.json(
@@ -110,7 +136,7 @@ export function createApp(
     );
     app.post(
       "/internal/v1/tenants/:tenantId/bill-catalogue/imports/:id/publications",
-      internal,
+      ...internal,
       async (req, res, next) => {
         try {
           const body = z
@@ -120,7 +146,7 @@ export function createApp(
           const result = await internalApi.catalogues.publish({
             tenantId: z.string().uuid().parse(req.params.tenantId),
             importId: z.string().uuid().parse(req.params.id),
-            actorId: z.string().uuid().parse(req.header("x-actor-id")),
+            actorId: administratorId(req),
             approvalId: body.approval_id,
             idempotencyKey: idempotency(req),
             correlationId: correlation(req),
@@ -133,29 +159,25 @@ export function createApp(
     );
   }
   if (customerApi) {
-    const authenticate = async (
-      req: express.Request,
-      res: express.Response,
-      next: express.NextFunction,
-    ) => {
-      try {
-        const authorization = req.header("authorization");
-        if (!authorization) throw new Error("AUTHORIZATION_REQUIRED");
-        const principal =
-          await customerApi.authenticator.authenticate(authorization);
-        if (req.header("x-tenant-id") !== principal.tenantId)
-          return void res.status(403).json({ code: "TENANT_MISMATCH" });
+    const customer = (policy: AccessPolicy): express.RequestHandler[] => [
+      customerApi.access.require(policy),
+      (req, res, next) => {
+        const { subject, tenantId } = principalOf(req);
+        if (!subject || !tenantId)
+          return void res
+            .status(403)
+            .json({ code: "CUSTOMER_CONTEXT_REQUIRED" });
         (
           req as express.Request & {
             paymentCustomer?: PaymentCustomerPrincipal;
           }
-        ).paymentCustomer = principal;
+        ).paymentCustomer = { tenantId, customerId: subject.id };
         next();
-      } catch {
-        res.status(401).json({ code: "UNAUTHORIZED" });
-      }
-    };
-    app.get("/v1/transactions", authenticate, async (req, res, next) => {
+      },
+    ];
+    const customerRead = customer(paymentAccessPolicies.customerRead);
+    const customerWrite = customer(paymentAccessPolicies.customerWrite);
+    app.get("/v1/transactions", ...customerRead, async (req, res, next) => {
       try {
         const principal = paymentCustomer(req);
         const size = z.coerce
@@ -178,7 +200,7 @@ export function createApp(
     });
     app.get(
       "/v1/wallet/funding-details",
-      authenticate,
+      ...customerRead,
       async (req, res, next) => {
         try {
           const principal = paymentCustomer(req);
@@ -215,7 +237,7 @@ export function createApp(
           customer_identifier: z.string().min(3).max(200),
         })
         .strict();
-      app.get("/v1/bills/products", authenticate, async (req, res, next) => {
+      app.get("/v1/bills/products", ...customerRead, async (req, res, next) => {
         try {
           const principal = paymentCustomer(req);
           const category = z
@@ -233,7 +255,7 @@ export function createApp(
       });
       app.post(
         "/v1/bills/customer-validations",
-        authenticate,
+        ...customerWrite,
         async (req, res, next) => {
           try {
             const principal = paymentCustomer(req);
@@ -254,7 +276,7 @@ export function createApp(
           }
         },
       );
-      app.post("/v1/bills/quotes", authenticate, async (req, res, next) => {
+      app.post("/v1/bills/quotes", ...customerWrite, async (req, res, next) => {
         try {
           const principal = paymentCustomer(req);
           const body = billQuote.parse(req.body);
@@ -274,7 +296,7 @@ export function createApp(
           next(error);
         }
       });
-      app.post("/v1/bills", authenticate, async (req, res, next) => {
+      app.post("/v1/bills", ...customerWrite, async (req, res, next) => {
         try {
           const principal = paymentCustomer(req);
           const body = billPayment.parse(req.body);
@@ -293,7 +315,7 @@ export function createApp(
           next(error);
         }
       });
-      app.get("/v1/bills/:id", authenticate, async (req, res, next) => {
+      app.get("/v1/bills/:id", ...customerRead, async (req, res, next) => {
         try {
           const principal = paymentCustomer(req);
           res.json(
@@ -308,23 +330,27 @@ export function createApp(
           next(error);
         }
       });
-      app.get("/v1/bills/:id/receipt", authenticate, async (req, res, next) => {
-        try {
-          const principal = paymentCustomer(req);
-          res.json(
-            await customerApi.bills!.queries.get(
-              principal.tenantId,
-              principal.customerId,
-              z.string().uuid().parse(req.params.id),
-              true,
-            ),
-          );
-        } catch (error) {
-          next(error);
-        }
-      });
+      app.get(
+        "/v1/bills/:id/receipt",
+        ...customerRead,
+        async (req, res, next) => {
+          try {
+            const principal = paymentCustomer(req);
+            res.json(
+              await customerApi.bills!.queries.get(
+                principal.tenantId,
+                principal.customerId,
+                z.string().uuid().parse(req.params.id),
+                true,
+              ),
+            );
+          } catch (error) {
+            next(error);
+          }
+        },
+      );
     }
-    app.get("/v1/transfers/:id", authenticate, async (req, res, next) => {
+    app.get("/v1/transfers/:id", ...customerRead, async (req, res, next) => {
       try {
         const principal = paymentCustomer(req);
         res.json(
@@ -341,7 +367,7 @@ export function createApp(
     });
     app.get(
       "/v1/transfers/:id/receipt",
-      authenticate,
+      ...customerRead,
       async (req, res, next) => {
         try {
           const principal = paymentCustomer(req);
@@ -416,8 +442,9 @@ function paymentCustomer(req: express.Request): PaymentCustomerPrincipal {
   return principal;
 }
 
-function sameSecret(left: string, right: string): boolean {
-  const a = Buffer.from(left);
-  const b = Buffer.from(right);
-  return a.length === b.length && timingSafeEqual(a, b);
+/** The acting administrator comes from the delegated token, never a header. */
+function administratorId(req: express.Request): string {
+  const subject = principalOf(req).subject;
+  if (subject?.type !== "ADMINISTRATOR") throw new Error("UNAUTHORIZED");
+  return subject.id;
 }

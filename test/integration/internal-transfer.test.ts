@@ -81,7 +81,7 @@ describeDatabase("PAY-05 internal transfers", () => {
     const command = {
       tenantId,
       customerId,
-      sourceAccountId,
+      sourceAccountId: sourceLedgerId,
       destinationAccountId,
       amountMinor: "50000",
       currency: "NGN",
@@ -121,7 +121,7 @@ describeDatabase("PAY-05 internal transfers", () => {
     const command = {
       tenantId,
       customerId,
-      sourceAccountId,
+      sourceAccountId: sourceLedgerId,
       destinationAccountId,
       amountMinor: "75000",
       currency: "NGN",
