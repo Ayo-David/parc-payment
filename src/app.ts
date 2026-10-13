@@ -11,6 +11,8 @@ import type { CustomerPaymentQueryService } from "./services/customer-payment-qu
 import type { CustomerBillQueryService } from "./services/customer-bill-query-service.js";
 import type { BillPaymentService } from "./services/bill-payment-service.js";
 import type { BillCatalogueService } from "./services/bill-catalogue-service.js";
+import type { ServicePayoutService } from "./services/service-payout-service.js";
+import type { BeneficiaryService } from "./services/beneficiary-service.js";
 
 export interface PaymentCustomerPrincipal {
   tenantId: string;
@@ -42,6 +44,11 @@ export const paymentAccessPolicies = {
     subjectTypes: ["ADMINISTRATOR"],
     actors: ["parc-admin-bff"],
   },
+  lendingPayout: {
+    scopes: ["payment.payouts.write"],
+    kinds: ["service", "delegated"],
+    actors: ["parc-lending"],
+  },
 } satisfies Record<string, AccessPolicy>;
 
 /** Builds the payment HTTP application with webhook and health routes. */
@@ -50,12 +57,17 @@ export function createApp(
   customerApi?: {
     access: PaymentAccess;
     queries: CustomerPaymentQueryService;
+    beneficiaries?: BeneficiaryService;
     bills?: {
       commands: BillPaymentService;
       queries: CustomerBillQueryService;
     };
   },
-  internalApi?: { access: PaymentAccess; catalogues: BillCatalogueService },
+  internalApi?: {
+    access: PaymentAccess;
+    catalogues: BillCatalogueService;
+    payouts: ServicePayoutService;
+  },
 ): Express {
   const app = express();
   app.disable("x-powered-by");
@@ -94,6 +106,57 @@ export function createApp(
     res.json({ status: "UP", service: "parc-payment" }),
   );
   if (internalApi) {
+    app.post(
+      "/internal/v1/service-payouts",
+      internalApi.access.require(paymentAccessPolicies.lendingPayout),
+      async (req, res, next) => {
+        try {
+          const body = z
+            .object({
+              source_service: z.literal("parc-lending"),
+              source_resource_id: z.string().uuid(),
+              customer_id: z.string().uuid(),
+              ledger_transaction_id: z.string().uuid(),
+              destination_reference: z.string().min(1).max(255),
+              amount_minor: z.string().regex(/^[1-9][0-9]*$/),
+              currency: z.literal("NGN"),
+              narration: z.string().min(1).max(140),
+            })
+            .strict()
+            .parse(req.body);
+          const principal = principalOf(req);
+          if (!principal.tenantId)
+            return void res
+              .status(403)
+              .json({ code: "TENANT_CONTEXT_REQUIRED" });
+          if (
+            principal.kind === "delegated" &&
+            principal.subject?.type === "CUSTOMER" &&
+            principal.subject.id !== body.customer_id
+          )
+            return void res.status(403).json({ code: "CUSTOMER_MISMATCH" });
+          const result = await internalApi.payouts.submit({
+            tenantId: principal.tenantId,
+            sourceService: body.source_service,
+            sourceResourceId: body.source_resource_id,
+            customerId: body.customer_id,
+            ledgerTransactionId: body.ledger_transaction_id,
+            destinationReference: body.destination_reference,
+            amountMinor: body.amount_minor,
+            currency: body.currency,
+            narration: body.narration,
+            idempotencyKey: idempotency(req),
+            correlationId: correlation(req),
+            // Providers receive only the opaque destination reference. Payment
+            // never reconstructs or persists the originating customer data.
+            providerData: { destination_reference: body.destination_reference },
+          });
+          res.status(result.replayed ? 200 : 202).json(result);
+        } catch (error) {
+          next(error);
+        }
+      },
+    );
     const internal: express.RequestHandler[] = [
       internalApi.access.require(paymentAccessPolicies.billCatalogue),
       (req, res, next) => {
@@ -187,17 +250,73 @@ export function createApp(
           .max(100)
           .default(20)
           .parse(req.query.page_size);
+        const cursor = z
+          .string()
+          .min(1)
+          .max(500)
+          .optional()
+          .parse(req.query.page_cursor);
         res.json(
           await customerApi.queries.transactions(
             principal.tenantId,
             principal.customerId,
             size,
+            cursor,
           ),
         );
       } catch (error) {
         next(error);
       }
     });
+    if (customerApi.beneficiaries) {
+      const beneficiaries = customerApi.beneficiaries;
+      app.get("/v1/beneficiaries", ...customerRead, async (req, res, next) => {
+        try {
+          const principal = paymentCustomer(req);
+          const kind = z
+            .enum(["all", "recent", "favourite"])
+            .default("all")
+            .parse(req.query.kind);
+          res.json(
+            await beneficiaries.list(
+              principal.tenantId,
+              principal.customerId,
+              kind,
+            ),
+          );
+        } catch (error) {
+          next(error);
+        }
+      });
+      app.post(
+        "/v1/beneficiaries",
+        ...customerWrite,
+        async (req, res, next) => {
+          try {
+            const principal = paymentCustomer(req);
+            const body = z
+              .object({
+                bank_code: z.string().regex(/^[0-9A-Za-z]{3,20}$/),
+                account_number: z.string().regex(/^[0-9]{10}$/),
+                name: z.string().trim().min(2).max(200),
+              })
+              .strict()
+              .parse(req.body);
+            const result = await beneficiaries.create({
+              tenantId: principal.tenantId,
+              customerId: principal.customerId,
+              bankCode: body.bank_code,
+              accountNumber: body.account_number,
+              name: body.name,
+              idempotencyKey: idempotency(req),
+            });
+            res.status(result.status).json(result.body);
+          } catch (error) {
+            next(error);
+          }
+        },
+      );
+    }
     app.get(
       "/v1/wallet/funding-details",
       ...customerRead,
@@ -400,14 +519,17 @@ export function createApp(
             ? 403
             : message.endsWith("NOT_FOUND")
               ? 404
-              : message === "RECEIPT_NOT_READY"
+              : message === "RECEIPT_NOT_READY" ||
+                  message === "IDEMPOTENCY_KEY_REUSED"
                 ? 409
-                : error instanceof z.ZodError
+                : message === "INVALID_PAGE_CURSOR"
                   ? 422
-                  : message.includes("unavailable") ||
-                      message.includes("not configured")
-                    ? 503
-                    : 500,
+                  : error instanceof z.ZodError
+                    ? 422
+                    : message.includes("unavailable") ||
+                        message.includes("not configured")
+                      ? 503
+                      : 500,
         )
         .json({ code: message });
     },

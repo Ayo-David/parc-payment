@@ -1,4 +1,7 @@
 import { z } from "zod";
+/** Optional setting where a blank value (e.g. `KEY=` in a docker env file) means unset. */
+const optional = <T extends z.ZodTypeAny>(type: T) =>
+  z.preprocess((value) => (value === "" ? undefined : value), type.optional());
 const schema = z.object({
   NODE_ENV: z
     .enum(["development", "test", "production"])
@@ -25,11 +28,11 @@ const schema = z.object({
   MONNIFY_API_KEY: z.string().min(8),
   MONNIFY_CLIENT_SECRET: z.string().min(12),
   MONNIFY_BASE_URL: z.string().url().default("https://sandbox.monnify.com"),
-  BANKONE_AUTH_TOKEN: z.string().min(12).optional(),
-  BANKONE_APPZONE_ACCOUNT: z.string().min(1).optional(),
-  BANKONE_CHANNEL_BASE_URL: z.string().url().optional(),
-  BANKONE_CORE_BASE_URL: z.string().url().optional(),
-  BANKONE_INTERBANK_TSQ_PATH: z.string().startsWith("/").optional(),
+  BANKONE_AUTH_TOKEN: optional(z.string().min(12)),
+  BANKONE_APPZONE_ACCOUNT: optional(z.string().min(1)),
+  BANKONE_CHANNEL_BASE_URL: optional(z.string().url()),
+  BANKONE_CORE_BASE_URL: optional(z.string().url()),
+  BANKONE_INTERBANK_TSQ_PATH: optional(z.string().startsWith("/")),
   SERVICE_NAME: z.string().default("parc-payment"),
   BILL_INQUIRY_WORKER_ID: z.string().min(1).default("bill-inquiry-worker-1"),
   BILL_INQUIRY_INTERVAL_MS: z.coerce.number().int().min(1000).default(10000),

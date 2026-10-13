@@ -8,6 +8,7 @@ import {
   ParcTokenClient,
 } from "./security/parc-service-auth.js";
 import { CustomerPaymentQueryService } from "./services/customer-payment-query-service.js";
+import { BeneficiaryService } from "./services/beneficiary-service.js";
 import { CustomerBillQueryService } from "./services/customer-bill-query-service.js";
 import { BillPaymentProviderRegistry } from "./services/bill-payment-provider.js";
 import { MonnifyBillPaymentProvider } from "./services/monnify-bill-payment-provider.js";
@@ -20,6 +21,7 @@ import {
 import { HttpLedgerPostingGateway } from "./services/ledger-gateway.js";
 import { BillPaymentService } from "./services/bill-payment-service.js";
 import { BillCatalogueService } from "./services/bill-catalogue-service.js";
+import { ServicePayoutService } from "./services/service-payout-service.js";
 const config = loadConfig();
 const database = createDatabase(config);
 const tokens = await ParcTokenClient.fromBase64Key({
@@ -64,6 +66,7 @@ const server = createServer(
     {
       access,
       queries: new CustomerPaymentQueryService(database),
+      beneficiaries: new BeneficiaryService(database),
       bills: {
         commands: billCommands,
         queries: new CustomerBillQueryService(database),
@@ -76,6 +79,7 @@ const server = createServer(
         monnify,
         new TenantAdminApprovalGateway(config.TENANT_ADMIN_URL, tokens),
       ),
+      payouts: new ServicePayoutService(database, routing),
     },
   ),
 );
