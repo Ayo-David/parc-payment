@@ -15,6 +15,7 @@ import type { BillPaymentService } from "../../src/services/bill-payment-service
 import type { CustomerBillQueryService } from "../../src/services/customer-bill-query-service.js";
 import type { CustomerPaymentQueryService } from "../../src/services/customer-payment-query-service.js";
 import type { PaystackWebhookService } from "../../src/services/paystack-webhook-service.js";
+import type { ServicePayoutService } from "../../src/services/service-payout-service.js";
 
 describe("customer bill HTTP API", () => {
   const tenantId = "11111111-1111-4111-8111-111111111111";
@@ -28,6 +29,11 @@ describe("customer bill HTTP API", () => {
   let app: ReturnType<typeof createApp>;
   const importDraft = jest.fn(async () => ({
     id: randomUUID(),
+    replayed: false,
+  }));
+  const submitPayout = jest.fn(async () => ({
+    id: randomUUID(),
+    status: "PENDING",
     replayed: false,
   }));
   const commands = {
@@ -95,6 +101,9 @@ describe("customer bill HTTP API", () => {
       {
         access,
         catalogues: { importDraft } as unknown as BillCatalogueService,
+        payouts: {
+          submit: submitPayout,
+        } as unknown as ServicePayoutService,
       },
     );
   });
@@ -182,5 +191,61 @@ describe("customer bill HTTP API", () => {
     expect(importDraft).toHaveBeenCalledWith(
       expect.objectContaining({ tenantId, actorId: administratorId }),
     );
+  });
+
+  it("accepts only a Lending-authorized payout request and takes its tenant from the token", async () => {
+    const lendingToken = await delegated(
+      "parc-lending",
+      "payment.payouts.write",
+      { id: customerId, type: "CUSTOMER" },
+    );
+    await request(app)
+      .post("/internal/v1/service-payouts")
+      .set("authorization", `Bearer ${lendingToken}`)
+      .set("x-tenant-id", tenantId)
+      .set("idempotency-key", "loan-payout-1")
+      .send({
+        source_service: "parc-lending",
+        source_resource_id: randomUUID(),
+        customer_id: customerId,
+        ledger_transaction_id: randomUUID(),
+        destination_reference: "opaque-destination-reference",
+        amount_minor: "100000",
+        currency: "NGN",
+        narration: "Loan disbursement",
+      })
+      .expect(202);
+    expect(submitPayout).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tenantId,
+        sourceService: "parc-lending",
+        providerData: { destination_reference: "opaque-destination-reference" },
+      }),
+    );
+  });
+
+  it("does not let a delegated Lending request name another customer", async () => {
+    const lendingToken = await delegated(
+      "parc-lending",
+      "payment.payouts.write",
+      { id: customerId, type: "CUSTOMER" },
+    );
+    await request(app)
+      .post("/internal/v1/service-payouts")
+      .set("authorization", `Bearer ${lendingToken}`)
+      .set("x-tenant-id", tenantId)
+      .set("idempotency-key", "loan-payout-customer-mismatch")
+      .send({
+        source_service: "parc-lending",
+        source_resource_id: randomUUID(),
+        customer_id: "99999999-9999-4999-8999-999999999999",
+        ledger_transaction_id: randomUUID(),
+        destination_reference: "opaque-destination-reference",
+        amount_minor: "100000",
+        currency: "NGN",
+        narration: "Loan disbursement",
+      })
+      .expect(403)
+      .expect({ code: "CUSTOMER_MISMATCH" });
   });
 });

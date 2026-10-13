@@ -1,20 +1,61 @@
 import type { Knex } from "knex";
+import { z } from "zod";
 import { withTenantTransaction } from "../database/client.js";
+
+export interface TransactionPage {
+  items: Record<string, unknown>[];
+  page: { next_cursor: string | null; has_more: boolean };
+}
+
+const cursorSchema = z.object({ v: z.literal(1), id: z.string().uuid() });
+
+/** Opaque keyset cursor naming the last row of the previous page. */
+export function encodeTransactionCursor(id: string): string {
+  return Buffer.from(JSON.stringify({ v: 1, id })).toString("base64url");
+}
+
+export function decodeTransactionCursor(cursor: string): string {
+  try {
+    return cursorSchema.parse(
+      JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")),
+    ).id;
+  } catch {
+    throw new Error("INVALID_PAGE_CURSOR");
+  }
+}
 
 export class CustomerPaymentQueryService {
   public constructor(private readonly db: Knex) {}
+  /** Newest first, ordered by (created_at, id) so pages never skip or repeat rows. */
   public transactions(
     tenantId: string,
     customerId: string,
     pageSize: number,
-  ): Promise<{ items: unknown[] }> {
-    return withTenantTransaction(this.db, tenantId, async (tx) => ({
-      items: await tx("payment_transactions")
+    cursor?: string,
+  ): Promise<TransactionPage> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const afterId = cursor ? decodeTransactionCursor(cursor) : undefined;
+      const query = tx("payment_transactions")
         .where({ tenant_id: tenantId, customer_id: customerId })
-        .whereNull("deleted_at")
-        .orderBy("created_at", "desc")
-        .limit(pageSize)
-        .select(
+        .whereNull("deleted_at");
+      if (afterId) {
+        const anchor = await tx("payment_transactions")
+          .where({ tenant_id: tenantId, customer_id: customerId, id: afterId })
+          .first("id");
+        if (!anchor) throw new Error("INVALID_PAGE_CURSOR");
+        // Compare in SQL so created_at keeps its microsecond precision.
+        query.whereRaw(
+          "(created_at, id) < (SELECT created_at, id FROM payment_transactions WHERE tenant_id = ? AND id = ?)",
+          [tenantId, afterId],
+        );
+      }
+      const rows = await query
+        .orderBy([
+          { column: "created_at", order: "desc" },
+          { column: "id", order: "desc" },
+        ])
+        .limit(pageSize + 1)
+        .select<Record<string, unknown>[]>(
           "id",
           "payment_type",
           "amount",
@@ -24,8 +65,19 @@ export class CustomerPaymentQueryService {
           "narration",
           "requested_at",
           "processed_at",
-        ),
-    }));
+        );
+      const items = rows.slice(0, pageSize);
+      const hasMore = rows.length > pageSize;
+      return {
+        items,
+        page: {
+          next_cursor: hasMore
+            ? encodeTransactionCursor(String(items[items.length - 1]!.id))
+            : null,
+          has_more: hasMore,
+        },
+      };
+    });
   }
   public fundingDetails(
     tenantId: string,
