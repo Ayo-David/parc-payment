@@ -56,6 +56,9 @@ export class AuthCustomerProfileGateway implements CustomerProfileGateway {
             audience: "parc-auth-customer",
             scopes: ["auth.customer-provider-profile.read"],
             tenantId,
+            // Service-only scope: never exchange the customer's token for it,
+            // even when this runs inside a customer-initiated request.
+            mode: "service",
           }),
           "x-tenant-id": tenantId,
           "x-calling-service": "parc-payment",

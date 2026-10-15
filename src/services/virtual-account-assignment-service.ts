@@ -129,16 +129,11 @@ export class VirtualAccountAssignmentService {
           .whereIn("status", [...OPEN_STATUSES, "ACTIVE"])
           .first<{ status: string } | undefined>("status");
         if (open) return undefined;
-        const providerRow = await tx("account_providers")
-          .where({
-            tenant_id: input.tenantId,
-            provider_code: provider.code,
-            is_active: true,
-          })
-          .whereNull("deleted_at")
-          .first<{ id: string } | undefined>("id");
-        if (!providerRow)
-          throw new Error("VIRTUAL_ACCOUNT_PROVIDER_NOT_CONFIGURED");
+        const providerRow = await this.tenantProvider(
+          tx,
+          input.tenantId,
+          provider.code,
+        );
         const accountId = randomUUID();
         const requestId = randomUUID();
         await tx("financial_accounts").insert({
@@ -199,6 +194,52 @@ export class VirtualAccountAssignmentService {
       });
       return { status: "FAILED", reason };
     }
+  }
+
+  /**
+   * Payment's record of the provider for this tenant, created on first use.
+   * Tenant Admin's routing decision is what authorizes the provider; this
+   * row only anchors the tenant's provider accounts. A tenant-wide lock
+   * keeps concurrent first requests from creating two (the table has no
+   * unique key on tenant + provider).
+   */
+  private async tenantProvider(
+    tx: Knex.Transaction,
+    tenantId: string,
+    providerCode: string,
+  ): Promise<{ id: string }> {
+    const find = () =>
+      tx("account_providers")
+        .where({ tenant_id: tenantId, provider_code: providerCode })
+        .whereNull("deleted_at")
+        .first<{ id: string; is_active: boolean } | undefined>(
+          "id",
+          "is_active",
+        );
+    const existing = await find();
+    if (existing) {
+      // An operator deactivated it deliberately; don't silently revive it.
+      if (!existing.is_active)
+        throw new Error("VIRTUAL_ACCOUNT_PROVIDER_NOT_CONFIGURED");
+      return existing;
+    }
+    await tx.raw("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", [
+      `account-provider:${tenantId}:${providerCode}`,
+    ]);
+    const raced = await find();
+    if (raced) return raced;
+    const [created] = await tx("account_providers")
+      .insert({
+        tenant_id: tenantId,
+        provider_code: providerCode,
+        provider_name:
+          providerCode.charAt(0) + providerCode.slice(1).toLowerCase(),
+        provider_type: "PAYMENT_PROCESSOR",
+        is_active: true,
+      })
+      .returning<{ id: string }[]>("id");
+    if (!created) throw new Error("Provider record was not created");
+    return created;
   }
 
   /** The customer's funding account as the app should present it. */
