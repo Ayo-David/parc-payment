@@ -22,6 +22,11 @@ import { HttpLedgerPostingGateway } from "./services/ledger-gateway.js";
 import { BillPaymentService } from "./services/bill-payment-service.js";
 import { BillCatalogueService } from "./services/bill-catalogue-service.js";
 import { ServicePayoutService } from "./services/service-payout-service.js";
+import { PaystackProvider } from "./services/paystack-provider.js";
+import { VirtualAccountAssignmentService } from "./services/virtual-account-assignment-service.js";
+import { AuthCustomerProfileGateway } from "./services/customer-profile-gateway.js";
+import { CollectionService } from "./services/collection-service.js";
+import { DepositService } from "./services/deposit-service.js";
 const config = loadConfig();
 const database = createDatabase(config);
 const tokens = await ParcTokenClient.fromBase64Key({
@@ -45,16 +50,38 @@ const billProviders = new BillPaymentProviderRegistry();
 billProviders.register(monnify);
 const paymentProviders = new ProviderRegistry();
 paymentProviders.register(monnify);
+const paystack = new PaystackProvider(
+  config.PAYSTACK_SECRET_KEY,
+  config.PAYSTACK_BASE_URL,
+  fetch,
+  config.PAYSTACK_DVA_PREFERRED_BANK ??
+    (config.PAYSTACK_SECRET_KEY.startsWith("sk_test_")
+      ? "test-bank"
+      : "titan-paystack"),
+);
+paymentProviders.register(paystack);
+const ledger = new HttpLedgerPostingGateway(config.LEDGER_URL, tokens);
+const deposits = new DepositService(
+  database,
+  paystack,
+  ledger,
+  new CollectionService(database, ledger),
+);
 const routing = new ProviderRoutingService(
   database,
   new TenantAdminProviderGateway(config.TENANT_ADMIN_URL, tokens),
   paymentProviders,
 );
+const virtualAccounts = new VirtualAccountAssignmentService(
+  database,
+  routing,
+  new AuthCustomerProfileGateway(config.AUTH_CUSTOMER_URL, tokens),
+);
 const billCommands = new BillPaymentService(
   database,
   routing,
   billProviders,
-  new HttpLedgerPostingGateway(config.LEDGER_URL, tokens),
+  ledger,
 );
 const server = createServer(
   createApp(
@@ -62,11 +89,15 @@ const server = createServer(
       database,
       config.PAYSTACK_SECRET_KEY,
       config.PAYSTACK_KEY_VERSION,
+      virtualAccounts,
+      deposits,
     ),
     {
       access,
       queries: new CustomerPaymentQueryService(database),
       beneficiaries: new BeneficiaryService(database),
+      virtualAccounts,
+      banks: paystack,
       bills: {
         commands: billCommands,
         queries: new CustomerBillQueryService(database),

@@ -25,6 +25,10 @@ const schema = z.object({
   PAYSTACK_SECRET_KEY: z.string().min(12),
   PAYSTACK_BASE_URL: z.string().url().default("https://api.paystack.co"),
   PAYSTACK_KEY_VERSION: z.string().min(1).default("default"),
+  /** Dedicated account partner bank; defaults to "test-bank" for sk_test_ keys, else "titan-paystack". */
+  PAYSTACK_DVA_PREFERRED_BANK: optional(z.string().min(1)),
+  /** Auth Customer, for the customer's legal name and contacts when opening provider accounts. */
+  AUTH_CUSTOMER_URL: z.string().url().default("http://127.0.0.1:3001"),
   MONNIFY_API_KEY: z.string().min(8),
   MONNIFY_CLIENT_SECRET: z.string().min(12),
   MONNIFY_BASE_URL: z.string().url().default("https://sandbox.monnify.com"),

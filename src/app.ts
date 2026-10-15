@@ -2,6 +2,8 @@ import express, { type Express } from "express";
 import { randomUUID } from "node:crypto";
 import helmet from "helmet";
 import type { PaystackWebhookService } from "./services/paystack-webhook-service.js";
+import type { VirtualAccountAssignmentService } from "./services/virtual-account-assignment-service.js";
+import type { TransferDirectoryProvider } from "./services/payment-provider.js";
 import { z } from "zod";
 import {
   principalOf,
@@ -58,6 +60,9 @@ export function createApp(
     access: PaymentAccess;
     queries: CustomerPaymentQueryService;
     beneficiaries?: BeneficiaryService;
+    virtualAccounts?: VirtualAccountAssignmentService;
+    /** Bank directory (Paystack), for the funding-account and transfer bank pickers. */
+    banks?: Pick<TransferDirectoryProvider, "listBanks">;
     bills?: {
       commands: BillPaymentService;
       queries: CustomerBillQueryService;
@@ -93,9 +98,11 @@ export function createApp(
           .status(
             code === "INVALID_PAYSTACK_SIGNATURE"
               ? 401
-              : code.includes("reused")
-                ? 409
-                : 400,
+              : code === "WEBHOOK_PROCESSING_FAILED"
+                ? 500
+                : code.includes("reused")
+                  ? 409
+                  : 400,
           )
           .json({ code });
       }
@@ -323,17 +330,139 @@ export function createApp(
       async (req, res, next) => {
         try {
           const principal = paymentCustomer(req);
-          res.json(
-            await customerApi.queries.fundingDetails(
-              principal.tenantId,
-              principal.customerId,
-            ),
+          try {
+            res.json(
+              await customerApi.queries.fundingDetails(
+                principal.tenantId,
+                principal.customerId,
+              ),
+            );
+            return;
+          } catch (error) {
+            if (
+              !(error instanceof Error) ||
+              error.message !== "FUNDING_ACCOUNT_NOT_FOUND" ||
+              !customerApi.virtualAccounts
+            )
+              throw error;
+          }
+          // No active account yet: say whether one is being opened.
+          const state = await customerApi.virtualAccounts.state(
+            principal.tenantId,
+            principal.customerId,
           );
+          if (state.status === "PENDING")
+            return void res.status(409).json({
+              code: "FUNDING_ACCOUNT_PENDING",
+              message: "Your account number is being set up",
+            });
+          if (state.status === "FAILED")
+            return void res.status(422).json({
+              code: "FUNDING_ACCOUNT_REJECTED",
+              message: state.reason,
+            });
+          res.status(404).json({
+            code: "FUNDING_ACCOUNT_NOT_FOUND",
+            message: "No account number has been set up yet",
+          });
         } catch (error) {
           next(error);
         }
       },
     );
+    if (customerApi.banks) {
+      const directory = customerApi.banks;
+      // The list changes rarely; refresh at most every six hours.
+      let cached:
+        | {
+            at: number;
+            banks: Promise<{ bank_code: string; bank_name: string }[]>;
+          }
+        | undefined;
+      app.get(
+        "/v1/reference/banks",
+        ...customerRead,
+        async (_req, res, next) => {
+          try {
+            if (!cached || Date.now() - cached.at > 6 * 60 * 60_000) {
+              const banks = directory.listBanks().then((list) =>
+                list
+                  .filter((bank) => bank.active)
+                  .map((bank) => ({
+                    bank_code: bank.code,
+                    bank_name: bank.name,
+                  }))
+                  .sort((a, b) => a.bank_name.localeCompare(b.bank_name)),
+              );
+              cached = { at: Date.now(), banks };
+              banks.catch(() => {
+                cached = undefined;
+              });
+            }
+            res.json({ banks: await cached.banks });
+          } catch (error) {
+            next(error);
+          }
+        },
+      );
+    }
+    if (customerApi.virtualAccounts) {
+      const virtualAccounts = customerApi.virtualAccounts;
+      app.post(
+        "/v1/wallet/virtual-account",
+        ...customerWrite,
+        async (req, res, next) => {
+          try {
+            const principal = paymentCustomer(req);
+            const body = z
+              .object({
+                // Optional: the BVN verified at onboarding is used when on file.
+                bvn: z
+                  .string()
+                  .regex(/^[0-9]{11}$/)
+                  .optional(),
+                bank_code: z.string().regex(/^[0-9A-Za-z]{3,20}$/),
+                account_number: z.string().regex(/^[0-9]{10}$/),
+                // Supplied by the Mobile BFF from Ledger, never by the client.
+                ledger_account_id: z.string().uuid(),
+              })
+              .strict()
+              .parse(req.body);
+            const state = await virtualAccounts
+              .request({
+                tenantId: principal.tenantId,
+                customerId: principal.customerId,
+                ledgerAccountId: body.ledger_account_id,
+                ...(body.bvn ? { bvn: body.bvn } : {}),
+                bankCode: body.bank_code,
+                accountNumber: body.account_number,
+                idempotencyKey: idempotency(req),
+                correlationId: correlation(req),
+              })
+              .catch((error: unknown) => {
+                if (error instanceof Error && error.message === "BVN_REQUIRED")
+                  return undefined;
+                throw error;
+              });
+            if (!state)
+              return void res.status(422).json({
+                code: "BVN_REQUIRED",
+                message: "Enter your BVN to get your account number",
+              });
+            if (state.status === "FAILED")
+              return void res.status(422).json({
+                code: "FUNDING_ACCOUNT_REJECTED",
+                message: state.reason,
+              });
+            res
+              .status(state.status === "ACTIVE" ? 200 : 202)
+              .json({ status: state.status });
+          } catch (error) {
+            next(error);
+          }
+        },
+      );
+    }
     if (customerApi.bills) {
       const billValidation = z
         .object({
