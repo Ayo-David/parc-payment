@@ -319,6 +319,40 @@ export class HttpLedgerPostingGateway
     });
   }
 
+  /**
+   * Returns the tenant's ledger account for `purpose`, creating it the first
+   * time. Ledger keeps one account per tenant, purpose and currency, so a
+   * repeat call with the same key returns the same account.
+   */
+  public async provisionTenantAccount(input: {
+    tenantId: string;
+    purpose: string;
+    accountType: "ASSET" | "LIABILITY" | "EQUITY" | "INCOME" | "EXPENSE";
+  }): Promise<string> {
+    const response = await this.request(
+      "/internal/v1/accounts",
+      {
+        tenantId: input.tenantId,
+        idempotencyKey: `tenant-account:${input.purpose}:NGN`,
+      },
+      {
+        owner_type: "TENANT",
+        owner_id: input.tenantId,
+        purpose: input.purpose,
+        account_type: input.accountType,
+        currency: "NGN",
+      },
+    );
+    const body = (await response.json().catch(() => ({}))) as {
+      account_id?: string;
+    };
+    if (!response.ok || !body.account_id)
+      throw new Error(
+        `Ledger account provisioning failed with ${String(response.status)}`,
+      );
+    return body.account_id;
+  }
+
   private async request(
     path: string,
     identity: { tenantId: string; idempotencyKey: string },

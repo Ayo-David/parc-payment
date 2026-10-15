@@ -49,6 +49,41 @@ export interface VirtualAccountResult {
 export interface VirtualAccountProvider extends PaymentProvider {
   createVirtualAccount(input: unknown): Promise<VirtualAccountResult>;
 }
+/** The customer a dedicated virtual account is opened for (their legal name). */
+export interface VirtualAccountHolder {
+  email: string;
+  firstName: string;
+  middleName?: string;
+  lastName: string;
+  phone: string;
+}
+
+/**
+ * Providers that validate the customer's BVN against a bank account they own
+ * and then open the dedicated account asynchronously, reporting the result by
+ * webhook (Paystack's "assign" flow). The BVN and bank account are passed
+ * straight through and never stored.
+ */
+export interface AssignableVirtualAccountProvider extends PaymentProvider {
+  assignVirtualAccount(input: {
+    holder: VirtualAccountHolder;
+    bvn: string;
+    bankCode: string;
+    accountNumber: string;
+  }): Promise<void>;
+}
+
+export function canAssignVirtualAccounts(
+  provider: PaymentProvider,
+): provider is AssignableVirtualAccountProvider {
+  return "assignVirtualAccount" in provider;
+}
+
+/** The provider declined the request outright; `message` is safe to show the customer. */
+export class ProviderRejectedError extends Error {
+  public readonly code = "PROVIDER_REJECTED";
+}
+
 export interface TransferDirectoryProvider extends PaymentProvider {
   listBanks(): Promise<Array<{ name: string; code: string; active: boolean }>>;
   nameEnquiry(input: { accountNumber: string; bankCode: string }): Promise<{

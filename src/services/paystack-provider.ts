@@ -1,12 +1,17 @@
 import type {
+  AssignableVirtualAccountProvider,
   PaymentProvider,
   ProviderInquiryContext,
   ProviderSubmission,
   VirtualAccountProvider,
+  VirtualAccountHolder,
   VirtualAccountResult,
   TransferDirectoryProvider,
 } from "./payment-provider.js";
-import { ProviderOutcomeAmbiguousError } from "./payment-provider.js";
+import {
+  ProviderOutcomeAmbiguousError,
+  ProviderRejectedError,
+} from "./payment-provider.js";
 import { z } from "zod";
 
 const virtualAccountSchema = z.object({
@@ -22,13 +27,19 @@ const transferSchema = z.object({
 });
 
 export class PaystackProvider
-  implements PaymentProvider, VirtualAccountProvider, TransferDirectoryProvider
+  implements
+    PaymentProvider,
+    VirtualAccountProvider,
+    AssignableVirtualAccountProvider,
+    TransferDirectoryProvider
 {
   public readonly code = "PAYSTACK";
   public constructor(
     private readonly secret: string,
     private readonly baseUrl = "https://api.paystack.co",
     private readonly http: typeof fetch = fetch,
+    /** Paystack's partner bank slug; "test-bank" with a test secret key. */
+    private readonly preferredBank = "titan-paystack",
   ) {}
   public supports(capability: string, currency: string): boolean {
     return (
@@ -225,25 +236,139 @@ export class PaystackProvider
     };
   }
 
+  /**
+   * Paystack's single-step dedicated account flow: creates the customer,
+   * validates the BVN against the bank account, then opens the account. Only
+   * acceptance is returned here; the outcome arrives as a
+   * dedicatedaccount.assign.* webhook.
+   */
+  public async assignVirtualAccount(input: {
+    holder: VirtualAccountHolder;
+    bvn: string;
+    bankCode: string;
+    accountNumber: string;
+  }): Promise<void> {
+    const response = await this.http(
+      new URL("/dedicated_account/assign", this.baseUrl),
+      {
+        method: "POST",
+        headers: this.headers(),
+        body: JSON.stringify({
+          email: input.holder.email,
+          first_name: input.holder.firstName,
+          ...(input.holder.middleName
+            ? { middle_name: input.holder.middleName }
+            : {}),
+          last_name: input.holder.lastName,
+          phone: input.holder.phone,
+          preferred_bank: this.preferredBank,
+          country: "NG",
+          bvn: input.bvn,
+          bank_code: input.bankCode,
+          account_number: input.accountNumber,
+        }),
+        signal: AbortSignal.timeout(20_000),
+      },
+    );
+    const body = (await response.json().catch(() => ({}))) as {
+      status?: boolean;
+      message?: string;
+    };
+    if (response.ok && body.status === true) return;
+    if (response.status >= 400 && response.status < 500)
+      throw new ProviderRejectedError(
+        typeof body.message === "string" && body.message.trim()
+          ? body.message.trim().slice(0, 200)
+          : "Paystack could not start the account request",
+      );
+    throw new Error(
+      `Paystack dedicated account assignment failed with ${String(response.status)}`,
+    );
+  }
+
   public async listBanks(): Promise<
     Array<{ name: string; code: string; active: boolean }>
   > {
-    const url = new URL("/bank", this.baseUrl);
-    url.searchParams.set("country", "nigeria");
-    url.searchParams.set("currency", "NGN");
-    url.searchParams.set("perPage", "100");
-    const response = await this.http(url, { headers: this.headers() });
-    const body = (await response.json()) as {
-      status?: boolean;
-      data?: Array<{ name?: string; code?: string; active?: boolean }>;
-    };
-    if (!response.ok || body.status !== true || !Array.isArray(body.data))
-      throw new Error(`Paystack bank discovery failed with ${response.status}`);
-    return body.data.flatMap((bank) =>
-      bank.name && bank.code
-        ? [{ name: bank.name, code: bank.code, active: bank.active !== false }]
-        : [],
+    // ~290 Nigerian banks and MFBs, served 100 per page behind a cursor.
+    const banks: Array<{ name: string; code: string; active: boolean }> = [];
+    let cursor: string | null = null;
+    for (let page = 0; page < 20; page += 1) {
+      const url = new URL("/bank", this.baseUrl);
+      url.searchParams.set("country", "nigeria");
+      url.searchParams.set("currency", "NGN");
+      url.searchParams.set("perPage", "100");
+      url.searchParams.set("use_cursor", "true");
+      if (cursor) url.searchParams.set("next", cursor);
+      const response = await this.http(url, { headers: this.headers() });
+      const body = (await response.json()) as {
+        status?: boolean;
+        data?: Array<{
+          name?: string;
+          code?: string;
+          active?: boolean;
+          is_deleted?: boolean;
+        }>;
+        meta?: { next?: string | null };
+      };
+      if (!response.ok || body.status !== true || !Array.isArray(body.data))
+        throw new Error(
+          `Paystack bank discovery failed with ${response.status}`,
+        );
+      for (const bank of body.data)
+        if (bank.name && bank.code && bank.is_deleted !== true)
+          banks.push({
+            name: bank.name,
+            code: bank.code,
+            active: bank.active !== false,
+          });
+      cursor = body.meta?.next ?? null;
+      if (!cursor) break;
+    }
+    return banks;
+  }
+
+  /**
+   * Re-reads a charge from Paystack before money is credited, so a deposit
+   * is only booked on Paystack's own record of status and amount.
+   */
+  public async verifyCharge(reference: string): Promise<{
+    status: string;
+    amountMinor: string;
+    /** What Paystack kept from the charge; settled amount = amount - fees. */
+    feesMinor: string;
+    currency: string;
+  }> {
+    const response = await this.http(
+      new URL(
+        `/transaction/verify/${encodeURIComponent(reference)}`,
+        this.baseUrl,
+      ),
+      { headers: this.headers(), signal: AbortSignal.timeout(15_000) },
     );
+    const body = (await response.json().catch(() => ({}))) as {
+      status?: boolean;
+      data?: {
+        status?: string;
+        amount?: number | string;
+        fees?: number | string | null;
+        currency?: string;
+      };
+    };
+    if (
+      !response.ok ||
+      body.status !== true ||
+      typeof body.data?.status !== "string" ||
+      body.data.amount === undefined
+    )
+      throw new Error(
+        `Paystack charge verification failed with ${String(response.status)}`,
+      );
+    return {
+      status: body.data.status,
+      amountMinor: String(body.data.amount),
+      feesMinor: String(body.data.fees ?? 0),
+      currency: body.data.currency ?? "NGN",
+    };
   }
 
   public async nameEnquiry(input: {
