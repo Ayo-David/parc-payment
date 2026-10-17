@@ -78,8 +78,8 @@ export class PaystackWebhookService {
     if (assignment && this.assignments)
       await this.assignments
         .applyWebhook(payload.event, payload.data)
-        .catch(() => {
-          throw new Error("WEBHOOK_PROCESSING_FAILED");
+        .catch((error: unknown) => {
+          throw new Error("WEBHOOK_PROCESSING_FAILED", { cause: error });
         });
     if (this.deposits && isDedicatedAccountDeposit(payload.event, payload.data))
       await this.deposits
@@ -88,8 +88,8 @@ export class PaystackWebhookService {
           webhookId: row.webhook_id,
           payloadHash,
         })
-        .catch(() => {
-          throw new Error("WEBHOOK_PROCESSING_FAILED");
+        .catch((error: unknown) => {
+          throw new Error("WEBHOOK_PROCESSING_FAILED", { cause: error });
         });
     return { webhookId: row.webhook_id, replayed: row.replayed };
   }
