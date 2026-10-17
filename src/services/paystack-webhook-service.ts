@@ -8,6 +8,10 @@ import {
   isVirtualAccountAssignmentEvent,
   type VirtualAccountAssignmentService,
 } from "./virtual-account-assignment-service.js";
+import {
+  isTransferEvent,
+  type TransferOutcomeService,
+} from "./transfer-outcome-service.js";
 
 export class PaystackWebhookService {
   public constructor(
@@ -19,6 +23,7 @@ export class PaystackWebhookService {
       "applyWebhook"
     >,
     private readonly deposits?: Pick<DepositService, "applyCharge">,
+    private readonly transfers?: Pick<TransferOutcomeService, "applyWebhook">,
   ) {}
   public verify(rawBody: Buffer, signature: string): boolean {
     if (!/^[a-f0-9]{128}$/i.test(signature)) return false;
@@ -87,6 +92,16 @@ export class PaystackWebhookService {
           data: payload.data,
           webhookId: row.webhook_id,
           payloadHash,
+        })
+        .catch((error: unknown) => {
+          throw new Error("WEBHOOK_PROCESSING_FAILED", { cause: error });
+        });
+    if (this.transfers && isTransferEvent(payload.event))
+      await this.transfers
+        .applyWebhook({
+          event: payload.event,
+          data: payload.data,
+          webhookId: row.webhook_id,
         })
         .catch((error: unknown) => {
           throw new Error("WEBHOOK_PROCESSING_FAILED", { cause: error });

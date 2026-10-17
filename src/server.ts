@@ -27,6 +27,10 @@ import { VirtualAccountAssignmentService } from "./services/virtual-account-assi
 import { AuthCustomerProfileGateway } from "./services/customer-profile-gateway.js";
 import { CollectionService } from "./services/collection-service.js";
 import { DepositService } from "./services/deposit-service.js";
+import { ExternalTransferService } from "./services/external-transfer-service.js";
+import { PaymentReversalService } from "./services/payment-reversal-service.js";
+import { TransferOutcomeService } from "./services/transfer-outcome-service.js";
+import { BankTransferService } from "./services/bank-transfer-service.js";
 const config = loadConfig();
 const database = createDatabase(config);
 const tokens = await ParcTokenClient.fromBase64Key({
@@ -72,6 +76,17 @@ const routing = new ProviderRoutingService(
   new TenantAdminProviderGateway(config.TENANT_ADMIN_URL, tokens),
   paymentProviders,
 );
+const externalTransfers = new ExternalTransferService(
+  database,
+  routing,
+  ledger,
+);
+const transferOutcomes = new TransferOutcomeService(
+  database,
+  paystack,
+  externalTransfers,
+  new PaymentReversalService(database, ledger),
+);
 const virtualAccounts = new VirtualAccountAssignmentService(
   database,
   routing,
@@ -91,6 +106,7 @@ const server = createServer(
       config.PAYSTACK_KEY_VERSION,
       virtualAccounts,
       deposits,
+      transferOutcomes,
     ),
     {
       access,
@@ -98,6 +114,16 @@ const server = createServer(
       beneficiaries: new BeneficiaryService(database),
       virtualAccounts,
       banks: paystack,
+      bankTransfers: new BankTransferService(
+        database,
+        routing,
+        externalTransfers,
+        ledger,
+        {
+          flatFeeMinor: config.TRANSFER_FLAT_FEE_MINOR,
+          maxAmountMinor: config.TRANSFER_MAX_AMOUNT_MINOR,
+        },
+      ),
       bills: {
         commands: billCommands,
         queries: new CustomerBillQueryService(database),

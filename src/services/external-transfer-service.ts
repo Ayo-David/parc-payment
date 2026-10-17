@@ -21,6 +21,8 @@ interface ExternalRow {
   ledger_transaction_id: string | null;
   active_attempt_id: string | null;
   request_hash: string;
+  fee_amount: string;
+  fee_ledger_account_id: string | null;
 }
 
 export class ExternalTransferService {
@@ -47,6 +49,12 @@ export class ExternalTransferService {
     idempotencyKey: string;
     correlationId: string;
     providerData: unknown;
+    /** Provider whose recipient the providerData names; routing must agree. */
+    requiredProvider?: string;
+    /** A customer transfer quote: spent once, and fixes the fee. */
+    quoteId?: string;
+    feeMinor?: string;
+    feeLedgerAccountId?: string;
   }): Promise<{
     id: string;
     paymentId: string;
@@ -61,6 +69,11 @@ export class ExternalTransferService {
       correlationId: input.correlationId,
       idempotencyKey: `external-transfer:${input.idempotencyKey}:route`,
     });
+    if (
+      input.requiredProvider &&
+      routed.provider.code !== input.requiredProvider
+    )
+      throw new Error("TRANSFER_PROVIDER_CHANGED");
     const requestHash = hash({
       customerId: input.customerId,
       sourceAccountId: input.sourceAccountId,
@@ -74,6 +87,9 @@ export class ExternalTransferService {
       narration: input.narration,
       provider: routed.provider.code,
       routingDecisionId: routed.decisionId,
+      ...(input.quoteId
+        ? { quoteId: input.quoteId, feeMinor: input.feeMinor ?? "0" }
+        : {}),
     });
     let row = await withTenantTransaction(
       this.db,
@@ -143,33 +159,49 @@ export class ExternalTransferService {
           idempotency_key: input.idempotencyKey,
           correlation_id: input.correlationId,
         });
-        await tx("payment_external_transfers").insert({
-          id: transferId,
-          tenant_id: input.tenantId,
-          payment_id: paymentId,
-          customer_id: input.customerId,
-          source_account_id: source.id,
-          source_ledger_account_id: source.ledger_account_id,
-          settlement_ledger_account_id: input.settlementLedgerAccountId,
-          ...(input.beneficiaryId
-            ? { beneficiary_id: input.beneficiaryId }
-            : {}),
-          beneficiary_name: input.beneficiaryName,
-          destination_account_number: input.destinationAccountNumber,
-          destination_bank_code: input.destinationBankCode,
-          ...(input.destinationBankName
-            ? { destination_bank_name: input.destinationBankName }
-            : {}),
-          ...(input.destinationPhoneNumber
-            ? { destination_phone_number: input.destinationPhoneNumber }
-            : {}),
-          amount: input.amountMinor,
-          currency: input.currency,
-          narration: input.narration,
-          idempotency_key: input.idempotencyKey,
-          request_hash: requestHash,
-          correlation_id: input.correlationId,
-        });
+        await tx("payment_external_transfers")
+          .insert({
+            id: transferId,
+            tenant_id: input.tenantId,
+            payment_id: paymentId,
+            customer_id: input.customerId,
+            source_account_id: source.id,
+            source_ledger_account_id: source.ledger_account_id,
+            settlement_ledger_account_id: input.settlementLedgerAccountId,
+            ...(input.beneficiaryId
+              ? { beneficiary_id: input.beneficiaryId }
+              : {}),
+            beneficiary_name: input.beneficiaryName,
+            destination_account_number: input.destinationAccountNumber,
+            destination_bank_code: input.destinationBankCode,
+            ...(input.destinationBankName
+              ? { destination_bank_name: input.destinationBankName }
+              : {}),
+            ...(input.destinationPhoneNumber
+              ? { destination_phone_number: input.destinationPhoneNumber }
+              : {}),
+            amount: input.amountMinor,
+            currency: input.currency,
+            narration: input.narration,
+            idempotency_key: input.idempotencyKey,
+            request_hash: requestHash,
+            correlation_id: input.correlationId,
+            ...(input.quoteId
+              ? {
+                  quote_id: input.quoteId,
+                  fee_amount: input.feeMinor ?? "0",
+                  fee_ledger_account_id: input.feeLedgerAccountId ?? null,
+                }
+              : {}),
+          })
+          .catch((error: unknown) => {
+            if (
+              (error as { constraint?: string }).constraint ===
+              "uq_external_quote"
+            )
+              throw new Error("TRANSFER_QUOTE_USED");
+            throw error;
+          });
         return (await tx("payment_external_transfers")
           .where({ id: transferId })
           .first<ExternalRow>())!;
@@ -184,7 +216,9 @@ export class ExternalTransferService {
         tenantId: input.tenantId,
         idempotencyKey: `external-transfer:${row.id}:hold`,
         accountId: row.source_ledger_account_id,
-        amountMinor: input.amountMinor,
+        amountMinor: (
+          BigInt(input.amountMinor) + BigInt(row.fee_amount ?? 0)
+        ).toString(),
         currency: input.currency,
         purpose: "EXTERNAL_TRANSFER",
         expiresAt: new Date(Date.now() + 24 * 60 * 60_000).toISOString(),
@@ -301,9 +335,13 @@ export class ExternalTransferService {
           inquiry_attempts: number;
         }>(),
     );
-    if (!attempt?.provider_reference)
+    const reference =
+      attempt &&
+      (attempt.provider_reference ??
+        input.provider.transferReferenceFor?.(row.id));
+    if (!reference)
       throw new Error("Provider reference unavailable for inquiry");
-    const outcome = await input.provider.inquire(attempt.provider_reference, {
+    const outcome = await input.provider.inquire(reference, {
       capability: "INTERBANK_TRANSFER",
       amountMinor: String(row.amount),
       transactionDate: new Date().toISOString().slice(0, 10),
@@ -385,6 +423,12 @@ export class ExternalTransferService {
         sourceAccountId: row.source_ledger_account_id,
         destinationAccountId: row.settlement_ledger_account_id,
         amountMinor: input.amountMinor,
+        ...(BigInt(row.fee_amount ?? 0) > 0n
+          ? {
+              feeMinor: String(row.fee_amount),
+              feeAccountId: row.fee_ledger_account_id!,
+            }
+          : {}),
       });
     } catch (error) {
       await this.update(input.tenantId, row.id, "MANUAL_REVIEW", {
