@@ -40,6 +40,21 @@ const schema = z.object({
   SERVICE_NAME: z.string().default("parc-payment"),
   BILL_INQUIRY_WORKER_ID: z.string().min(1).default("bill-inquiry-worker-1"),
   BILL_INQUIRY_INTERVAL_MS: z.coerce.number().int().min(1000).default(10000),
+  /** Flat fee, in kobo, on every customer bank transfer (until Tenant Admin owns it). */
+  TRANSFER_FLAT_FEE_MINOR: z
+    .string()
+    .regex(/^(0|[1-9][0-9]*)$/)
+    .default("5000"),
+  /** Largest single customer bank transfer, in kobo. */
+  TRANSFER_MAX_AMOUNT_MINOR: z
+    .string()
+    .regex(/^[1-9][0-9]*$/)
+    .default("100000000"),
+  PAYMENT_INQUIRY_WORKER_ID: z
+    .string()
+    .min(1)
+    .default("payment-inquiry-worker-1"),
+  PAYMENT_INQUIRY_INTERVAL_MS: z.coerce.number().int().min(1000).default(10000),
 });
 export type AppConfig = z.infer<typeof schema>;
 export const loadConfig = (): AppConfig => schema.parse(process.env);

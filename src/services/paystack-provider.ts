@@ -112,13 +112,24 @@ export class PaystackProvider
     };
     if (!response.ok || body.status !== true || !body.data?.reference)
       throw new Error(`Paystack inquiry failed with ${response.status}`);
+    const status = body.data.status ?? "pending";
+    // A reversed transfer returned the money to our Paystack balance, so it is
+    // a final failure; "otp" and "queued" stay pending.
     const state =
-      body.data.status === "success"
+      status === "success"
         ? "SUCCESS"
-        : body.data.status === "failed" || body.data.status === "abandoned"
+        : status === "failed" || status === "abandoned" || status === "reversed"
           ? "FAILED"
           : "PENDING";
-    return { providerReference: body.data.reference, state };
+    return {
+      providerReference: body.data.reference,
+      state,
+      providerStatus: status,
+    };
+  }
+
+  public transferReferenceFor(operationId: string): string {
+    return `parc-${operationId.toLowerCase()}`.slice(0, 50);
   }
 
   private async submitTransfer(input: {
@@ -130,7 +141,7 @@ export class PaystackProvider
     if (input.currency !== "NGN" || !/^[1-9][0-9]*$/.test(input.amountMinor))
       throw new Error("Paystack transfer requires positive NGN minor units");
     const data = transferSchema.parse(input.providerData);
-    const reference = `parc-${input.operationId.toLowerCase()}`.slice(0, 50);
+    const reference = this.transferReferenceFor(input.operationId);
     let response: Response;
     try {
       response = await this.http(new URL("/transfer", this.baseUrl), {
@@ -383,6 +394,12 @@ export class PaystackProvider
       status?: boolean;
       data?: { account_name?: string };
     };
+    // A 4xx is Paystack saying the account doesn't resolve; anything else is
+    // an outage the customer can retry.
+    if (response.status >= 400 && response.status < 500)
+      throw new ProviderRejectedError(
+        `Paystack account resolution rejected with ${response.status}`,
+      );
     if (!response.ok || body.status !== true || !body.data?.account_name)
       throw new Error(
         `Paystack account resolution failed with ${response.status}`,

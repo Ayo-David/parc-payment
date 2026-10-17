@@ -15,6 +15,7 @@ import type { BillPaymentService } from "./services/bill-payment-service.js";
 import type { BillCatalogueService } from "./services/bill-catalogue-service.js";
 import type { ServicePayoutService } from "./services/service-payout-service.js";
 import type { BeneficiaryService } from "./services/beneficiary-service.js";
+import type { BankTransferService } from "./services/bank-transfer-service.js";
 
 export interface PaymentCustomerPrincipal {
   tenantId: string;
@@ -63,6 +64,8 @@ export function createApp(
     virtualAccounts?: VirtualAccountAssignmentService;
     /** Bank directory (Paystack), for the funding-account and transfer bank pickers. */
     banks?: Pick<TransferDirectoryProvider, "listBanks">;
+    /** Name enquiry, quote and submit for customer bank transfers. */
+    bankTransfers?: Pick<BankTransferService, "enquire" | "quote" | "submit">;
     bills?: {
       commands: BillPaymentService;
       queries: CustomerBillQueryService;
@@ -409,6 +412,103 @@ export function createApp(
         },
       );
     }
+    if (customerApi.bankTransfers) {
+      const bankTransfers = customerApi.bankTransfers;
+      const destination = {
+        bank_code: z.string().regex(/^[0-9]{3,10}$/),
+        account_number: z.string().regex(/^[0-9]{10}$/),
+      };
+      const minor = z.string().regex(/^[1-9][0-9]*$/);
+      app.post(
+        "/v1/transfers/name-enquiries",
+        ...customerWrite,
+        async (req, res, next) => {
+          try {
+            const principal = paymentCustomer(req);
+            const body = z.object(destination).strict().parse(req.body);
+            res.json(
+              await bankTransfers.enquire({
+                tenantId: principal.tenantId,
+                customerId: principal.customerId,
+                bankCode: body.bank_code,
+                accountNumber: body.account_number,
+                idempotencyKey: idempotency(req),
+                correlationId: correlation(req),
+              }),
+            );
+          } catch (error) {
+            next(error);
+          }
+        },
+      );
+      app.post(
+        "/v1/transfers/quotes",
+        ...customerWrite,
+        async (req, res, next) => {
+          try {
+            const principal = paymentCustomer(req);
+            const body = z
+              .object({
+                enquiry_token: z.string().min(16),
+                amount_minor: minor,
+                currency: z.string().regex(/^[A-Z]{3}$/),
+                narration: z.string().min(1).max(100).optional(),
+              })
+              .strict()
+              .parse(req.body);
+            res.json(
+              await bankTransfers.quote({
+                tenantId: principal.tenantId,
+                customerId: principal.customerId,
+                enquiryToken: body.enquiry_token,
+                amountMinor: body.amount_minor,
+                currency: body.currency,
+                ...(body.narration ? { narration: body.narration } : {}),
+                idempotencyKey: idempotency(req),
+              }),
+            );
+          } catch (error) {
+            next(error);
+          }
+        },
+      );
+      app.post(
+        "/v1/transfers/bank",
+        ...customerWrite,
+        async (req, res, next) => {
+          try {
+            const principal = paymentCustomer(req);
+            const body = z
+              .object({
+                ...destination,
+                quote_id: z.string().uuid(),
+                source_account_id: z.string().uuid(),
+                amount_minor: minor,
+                currency: z.string().regex(/^[A-Z]{3}$/),
+                narration: z.string().min(1).max(100),
+              })
+              .strict()
+              .parse(req.body);
+            const result = await bankTransfers.submit({
+              tenantId: principal.tenantId,
+              customerId: principal.customerId,
+              quoteId: body.quote_id,
+              sourceAccountId: body.source_account_id,
+              bankCode: body.bank_code,
+              accountNumber: body.account_number,
+              amountMinor: body.amount_minor,
+              currency: body.currency,
+              narration: body.narration,
+              idempotencyKey: idempotency(req),
+              correlationId: correlation(req),
+            });
+            res.status(result.replayed ? 200 : 202).json(result);
+          } catch (error) {
+            next(error);
+          }
+        },
+      );
+    }
     if (customerApi.virtualAccounts) {
       const virtualAccounts = customerApi.virtualAccounts;
       app.post(
@@ -652,9 +752,11 @@ export function createApp(
             : message.endsWith("NOT_FOUND")
               ? 404
               : message === "RECEIPT_NOT_READY" ||
-                  message === "IDEMPOTENCY_KEY_REUSED"
+                  message === "IDEMPOTENCY_KEY_REUSED" ||
+                  message === "TRANSFER_QUOTE_USED"
                 ? 409
-                : message === "INVALID_PAGE_CURSOR"
+                : message === "INVALID_PAGE_CURSOR" ||
+                    unprocessableTransfer.has(message)
                   ? 422
                   : error instanceof z.ZodError
                     ? 422
@@ -679,6 +781,17 @@ function assertCustomer(
 function idempotency(req: express.Request): string {
   return z.string().min(1).max(255).parse(req.header("idempotency-key"));
 }
+
+/** Customer bank transfer refusals the client can act on (re-quote, top up). */
+const unprocessableTransfer = new Set([
+  "ACCOUNT_RESOLUTION_FAILED",
+  "INSUFFICIENT_FUNDS",
+  "TRANSFER_ENQUIRY_EXPIRED",
+  "TRANSFER_LIMIT_EXCEEDED",
+  "TRANSFER_PROVIDER_CHANGED",
+  "TRANSFER_QUOTE_EXPIRED",
+  "TRANSFER_QUOTE_MISMATCH",
+]);
 
 const malformedWebhook = new Set([
   "INVALID_PAYSTACK_EVENT",

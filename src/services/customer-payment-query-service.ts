@@ -133,6 +133,7 @@ export class CustomerPaymentQueryService {
           "destination_bank_code",
           "destination_bank_name",
           "amount",
+          "fee_amount",
           "currency",
           "narration",
           "status",

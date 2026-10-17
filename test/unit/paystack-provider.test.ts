@@ -45,7 +45,56 @@ describe("Paystack provider adapter", () => {
     await expect(provider.inquire("PARC-1")).resolves.toEqual({
       providerReference: "PARC-1",
       state: "SUCCESS",
+      providerStatus: "success",
     });
+  });
+
+  it.each([
+    ["success", "SUCCESS"],
+    ["failed", "FAILED"],
+    ["reversed", "FAILED"],
+    ["otp", "PENDING"],
+    ["pending", "PENDING"],
+  ])(
+    "maps a verified transfer status of %s to %s",
+    async (status, expected) => {
+      const http = jest.fn(
+        async (...httpArguments: Parameters<typeof fetch>) => {
+          void httpArguments;
+          return new Response(
+            JSON.stringify({
+              status: true,
+              data: { reference: "parc-transfer-1", status },
+            }),
+            { status: 200 },
+          );
+        },
+      );
+      const provider = new PaystackProvider(
+        "sk_test_synthetic",
+        "https://api.paystack.co",
+        http,
+      );
+      await expect(
+        provider.inquire("parc-transfer-1", {
+          capability: "INTERBANK_TRANSFER",
+        }),
+      ).resolves.toEqual({
+        providerReference: "parc-transfer-1",
+        state: expected,
+        providerStatus: status,
+      });
+      expect(String(http.mock.calls[0]?.[0])).toBe(
+        "https://api.paystack.co/transfer/verify/parc-transfer-1",
+      );
+    },
+  );
+
+  it("derives the same transfer reference it submits with", () => {
+    const provider = new PaystackProvider("sk_test_synthetic");
+    expect(
+      provider.transferReferenceFor("AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE"),
+    ).toBe("parc-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
   });
 
   it("creates a Paystack customer and dedicated NGN account", async () => {

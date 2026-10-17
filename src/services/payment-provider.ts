@@ -35,6 +35,12 @@ export interface PaymentProvider {
     providerReference: string,
     context?: ProviderInquiryContext,
   ): Promise<ProviderSubmission>;
+  /**
+   * The transfer reference a provider derives from our operation id, when it
+   * is deterministic. Lets an ambiguous submission (no response, so no stored
+   * reference) still be inquired.
+   */
+  transferReferenceFor?(operationId: string): string;
 }
 
 export interface VirtualAccountResult {

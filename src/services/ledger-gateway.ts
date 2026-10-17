@@ -21,6 +21,7 @@ export interface LedgerTransferGateway {
     purpose: string;
     expiresAt: string;
   }): Promise<{ holdId: string; replayed: boolean }>;
+  /** Debits amount plus any fee from the source; the fee goes to feeAccountId. */
   captureHold(input: {
     tenantId: string;
     idempotencyKey: string;
@@ -29,6 +30,8 @@ export interface LedgerTransferGateway {
     sourceAccountId: string;
     destinationAccountId: string;
     amountMinor: string;
+    feeMinor?: string;
+    feeAccountId?: string;
   }): Promise<{ transactionId: string; replayed: boolean }>;
   releaseHold(input: {
     tenantId: string;
@@ -151,7 +154,10 @@ export class HttpLedgerPostingGateway
     const body = (await response.json()) as {
       hold_id?: string;
       replayed?: boolean;
+      code?: string;
     };
+    if (body.code === "INSUFFICIENT_AVAILABLE_BALANCE")
+      throw new Error("INSUFFICIENT_FUNDS");
     if (!response.ok || !body.hold_id)
       throw new Error(`Ledger hold failed with ${response.status}`);
     return { holdId: body.hold_id, replayed: body.replayed === true };
@@ -165,25 +171,34 @@ export class HttpLedgerPostingGateway
     sourceAccountId: string;
     destinationAccountId: string;
     amountMinor: string;
+    feeMinor?: string;
+    feeAccountId?: string;
   }): Promise<{ transactionId: string; replayed: boolean }> {
+    const fee = BigInt(input.feeMinor ?? "0");
+    if (fee > 0n && !input.feeAccountId)
+      throw new Error("Fee revenue account required");
+    const entries = [
+      {
+        account_id: input.sourceAccountId,
+        direction: "DEBIT",
+        amount_minor: (BigInt(input.amountMinor) + fee).toString(),
+      },
+      {
+        account_id: input.destinationAccountId,
+        direction: "CREDIT",
+        amount_minor: input.amountMinor,
+      },
+    ];
+    if (fee > 0n)
+      entries.push({
+        account_id: input.feeAccountId!,
+        direction: "CREDIT",
+        amount_minor: fee.toString(),
+      });
     const response = await this.request(
       `/internal/v1/holds/${encodeURIComponent(input.holdId)}/capture`,
       input,
-      {
-        reference: input.reference,
-        entries: [
-          {
-            account_id: input.sourceAccountId,
-            direction: "DEBIT",
-            amount_minor: input.amountMinor,
-          },
-          {
-            account_id: input.destinationAccountId,
-            direction: "CREDIT",
-            amount_minor: input.amountMinor,
-          },
-        ],
-      },
+      { reference: input.reference, entries },
     );
     const body = (await response.json()) as {
       transaction_id?: string;
