@@ -92,19 +92,22 @@ export function createApp(
           .status(result.replayed ? 409 : 202)
           .json({ webhook_id: result.webhookId, replayed: result.replayed });
       } catch (error) {
-        const code =
-          error instanceof Error ? error.message : "WEBHOOK_REJECTED";
-        res
-          .status(
-            code === "INVALID_PAYSTACK_SIGNATURE"
-              ? 401
-              : code === "WEBHOOK_PROCESSING_FAILED"
-                ? 500
-                : code.includes("reused")
-                  ? 409
-                  : 400,
-          )
-          .json({ code });
+        const message = error instanceof Error ? error.message : String(error);
+        // Only a malformed delivery is the sender's fault (4xx: Paystack stops
+        // retrying). Anything unexpected is ours: 500 makes Paystack redeliver,
+        // and the raw cause stays in our logs rather than in its dashboard.
+        const status =
+          message === "INVALID_PAYSTACK_SIGNATURE"
+            ? 401
+            : message.includes("reused")
+              ? 409
+              : malformedWebhook.has(message) || error instanceof SyntaxError
+                ? 400
+                : 500;
+        logWebhookFailure(req, status, error);
+        res.status(status).json({
+          code: status === 500 ? "WEBHOOK_PROCESSING_FAILED" : message,
+        });
       }
     },
   );
@@ -675,6 +678,36 @@ function assertCustomer(
 
 function idempotency(req: express.Request): string {
   return z.string().min(1).max(255).parse(req.header("idempotency-key"));
+}
+
+const malformedWebhook = new Set([
+  "INVALID_PAYSTACK_EVENT",
+  "INVALID_PAYSTACK_EVENT_IDENTITY",
+]);
+
+/**
+ * One JSON line per rejected webhook so a failed delivery in the Paystack
+ * dashboard can be traced. Never logs the payload, headers or signature.
+ */
+function logWebhookFailure(
+  req: express.Request,
+  status: number,
+  error: unknown,
+): void {
+  const cause = error instanceof Error ? error.cause : undefined;
+  console.error(
+    JSON.stringify({
+      level: status >= 500 ? "error" : "warn",
+      time: new Date().toISOString(),
+      msg: "Paystack webhook rejected",
+      correlation_id: req.header("x-correlation-id") ?? null,
+      status,
+      error: error instanceof Error ? error.message : String(error),
+      ...(cause !== undefined
+        ? { cause: cause instanceof Error ? cause.message : String(cause) }
+        : {}),
+    }),
+  );
 }
 
 function correlation(req: express.Request): string {
